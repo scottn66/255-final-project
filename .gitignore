@@ -5,3 +5,7 @@ __pycache__/
 data/*.mat
 data/*.npy
 .DS_Store
+docs/node_modules/
+docs/package-lock.json
+docs/slides_preview/
+docs/unpacked/

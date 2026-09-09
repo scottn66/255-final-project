@@ -25,6 +25,10 @@ Teammates and other AIs: read [AGENTS.md](AGENTS.md), then the bulletin index, t
 
 WIP limit: **one implementation ticket** at a time.
 
+## Class intro slides
+
+Nine-slide briefing for class and professor (problem, gap, data, method, evaluation, timeline): [`docs/SSFT-Wave_class_intro.pptx`](docs/SSFT-Wave_class_intro.pptx).
+
 ## Spike (already done)
 
 From-scratch attention + sinusoidal λ-PE + a C-agnostic spectral stub. See [2.10](bulletins/2.10-sprint-1.md).
