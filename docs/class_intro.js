@@ -245,7 +245,7 @@ function slide2() {
     {
       n: "03",
       t: "The 99% OA trap",
-      d: "Random-pixel splits leak 8-connected neighbors into train and test. Indian Pines is also badly imbalanced (Oats n=20 vs Soybean-mintill n=2455).",
+      d: "Random-pixel splits leak neighbors into train and test. On Indian Pines a 3×3 window already covers ~31% of test pixels at 5% train, ~86% at 25%. 3D-CNN OA can drop ~37% under a true spatial split.",
     },
   ];
   fails.forEach((f, i) => {
@@ -285,7 +285,7 @@ function slide2() {
 
   addFooterCite(
     s,
-    "LESSViT §1–§2 (Si et al., arXiv:2605.18541): spectral configuration shift. Spatial leakage: HSIC disjoint-sampling literature (random vs region splits)."
+    "LESSViT §1–§2 (arXiv:2605.18541). Leakage numbers: Nalepa, Myller, Kawulok, arXiv:1811.03707 / IEEE GRSL 2019."
   );
   s.addNotes(
     "Problem is spectral configuration shift plus evaluation leakage. Do not spend this slide on wildfire or SOTA leaderboards."
@@ -431,7 +431,7 @@ function slide4() {
 
   const items = [
     { k: "From scratch", v: "We write Q, K, V, scaled dot-product, multi-head split/concat, residual+FFN, and cross-attention ourselves. No nn.MultiheadAttention, no timm, no HuggingFace ViT blocks, no pretrained weights." },
-    { k: "One surgical change", v: "Copy SSFT §3 (D=64, s=8, 1 spectral MHSA, 1 spatial block, 1 fusion). Replace P ∈ R^{C×D} with sinusoidal 1D PE on λ in nm. Tie every C-mixing layer so C is not a weight shape." },
+    { k: "One surgical graft", v: "Copy SSFT §3. Steal two LESSViT ideas (tied projection, wavelength PE) — not LESS Attention, not SSRoPE. Sinusoidal λ-PE stands in for their rotary encoding. The graft plus the band-drop protocol is the class experiment, not a new operator." },
     { k: "The claim we will test", v: "SSFT-Wave should lose less AA / macro-F1 than a fixed-C ViT when bands are dropped or swapped. Relative drop (ID − OOD) / ID is the headline, not raw OA." },
   ];
   items.forEach((it, i) => {
@@ -465,7 +465,7 @@ function slide4() {
     });
   });
 
-  s.addNotes("Novelty is the combination and the evaluation protocol, not a new attention operator. Be explicit that 516k is the paper’s count; our D=64 reconstruction may land ~0.16–0.23M.");
+  s.addNotes("Deep-research check: tied embed and λ-PE are already in LESSViT §2; SSRoPE is rotary, not additive sinusoids. Do not claim a new mechanism. Claim the graft onto SSFT fusion plus a class-scale protocol. Paper 516k vs our D=64 reconstruction ~0.16–0.23M — report ours.");
 }
 
 // ======================================================================
@@ -510,7 +510,7 @@ function slide5() {
     color: COLOR.ink,
     margin: 0,
   });
-  s.addText("AVIRIS  ·  145×145  ·  16 classes  ·  ~200 bands after dropping water-absorption channels  ·  ~400–2500 nm  ·  10,249 labeled pixels, highly imbalanced.", {
+  s.addText("AVIRIS  ·  145×145  ·  16 classes  ·  Purdue 220-band cube, commonly 200 after dropping water-absorption bands  ·  ~400–2500 nm  ·  10,249 labeled pixels (Oats 20 vs Soybean-mintill 2455).", {
     x: 1.1,
     y: 2.55,
     w: 5.2,
@@ -553,7 +553,7 @@ function slide5() {
     color: COLOR.ink,
     margin: 0,
   });
-  s.addText("ROSIS  ·  610×340  ·  9 urban classes  ·  103 bands  ·  430–860 nm. Same patch and split rules. Confirms the protocol is not Indian Pines-specific.", {
+  s.addText("ROSIS  ·  9 urban classes  ·  103 bands  ·  ~430–860 nm (sources vary 850/860). Captured 610×610; after discarding no-data strips the usual cube is 610×340×103. Same patch and split rules.", {
     x: 7.3,
     y: 2.55,
     w: 4.9,
@@ -604,7 +604,7 @@ function slide5() {
   });
 
   addFooterCite(s, "GIC / UPV-EHU Hyperspectral Remote Sensing Scenes; Purdue AVIRIS Indian Pines. SSFT itself is cube→class; we adapt modules to labeled-center patches.");
-  s.addNotes("If asked why not EuroSAT RGB: wrong sensor. Stretch later is 13-band EuroSAT-MS / Sentinel-2, not this intro.");
+  s.addNotes("GIC lists 224 bands then 200 after water-absorption drop; Purdue’s Site 3 release is a 220-band cube, and 220−20=200. Prefer ‘220-band product, commonly 200 bands.’ Pavia 610×340 is after discarding no-data strips from 610×610.");
 }
 
 // ======================================================================
@@ -832,7 +832,7 @@ function slide7() {
     margin: 0,
   });
 
-  addFooterCite(s, "Protocol adapted from LESSViT §3.1 (train C120 VNIR+; test ID / SWIR+ / disjoint / full-C), shrunk to Indian Pines / Pavia U.");
+  addFooterCite(s, "Relative-drop protocol from LESSViT §3.1. Random ~50% drop is our class operationalization. SSFT itself has no band-drop protocol.");
   s.addNotes("Ablations later: fused vs spectral-only vs spatial-only (SSFT Tab. 4); index vs λ-PE.");
 }
 
