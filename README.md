@@ -29,6 +29,10 @@ WIP limit: **one implementation ticket** at a time.
 
 Nine-slide briefing for class and professor (problem, gap, data, method, evaluation, timeline): [`docs/SSFT-Wave_class_intro.pptx`](docs/SSFT-Wave_class_intro.pptx).
 
+## Research notes
+
+[docs/research/2026-09-10-project-direction-review.md](docs/research/2026-09-10-project-direction-review.md) — deep-research memo on whether to pivot: why the current framing reads as a toy, what the 2025–2026 HSI / edge-NPU landscape leaves open, four candidate directions, and a recommended proposal in the professor's outline.
+
 ## Spike (already done)
 
 From-scratch attention + sinusoidal λ-PE + a C-agnostic spectral stub. See [2.10](bulletins/2.10-sprint-1.md).
