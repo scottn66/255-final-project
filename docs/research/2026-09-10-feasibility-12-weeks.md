@@ -38,9 +38,10 @@ Sponsored equipment changes the risk profile in two ways. The compiler-access ri
 
 Three tiers, in order of credibility:
 
-1. **Within-sensor configuration shift (headline).** LESSViT's template shrunk to SpectralWaste: train on a fixed 120-band subset that is short-wavelength-heavy, test on the same subset, on the long-wavelength-heavy complement of equal size, on the fully disjoint 104-band complement, and on all 224 bands. Report in-distribution mIoU and relative drop per setting, three seeds. Expect the fixed-channel baseline to win in-distribution and to lose under shift, exactly as LESSViT reports.
-2. **Few-shot new-camera adaptation.** Adapt the SpectralWaste-trained spectral path to MWIR-4-Plastic's FENIX SWIR window with K = 1, 2, 4 training cubes versus training from scratch. This confounds sensor change with scene change, so present it as the recycling-relevant "new plant, new camera, K labeled cubes" question, not as a pure sensor result.
-3. **Disjoint-range negative control.** FENIX → FX50 zero-shot, expected to collapse, reported with the physics explanation. Reviewers reward an honest, explained failure case.
+1. **Within-sensor configuration shift (headline).** LESSViT's protocol shrunk to SpectralWaste (LESSViT is an unrefereed May 2026 preprint, so cite it as a design precedent, not as a standard): train on a fixed 120-band subset that is short-wavelength-heavy, test on the same subset, on the long-wavelength-heavy complement of equal size, on the fully disjoint 104-band complement, and on all 224 bands. Report in-distribution mIoU and relative drop per setting, three seeds. Expect the fixed-channel baseline to win in-distribution and to lose under shift, exactly as LESSViT reports.
+2. **Simulated cross-camera transfer by spectral-response-function resampling (recommended addition).** LESSViT's authors added exactly this to their repo after the preprint: they resample EnMAP cubes through other instruments' spectral response functions to build `prisma_like`, `sentinel2_like`, `desis_like` and `eo1h_like` test configurations, then evaluate the same fixed-configuration checkpoint on them, and they validate against real DESIS (235 bands, 402–999 nm) and EO-1 Hyperion (198 bands, 427–2396 nm) test sets. Training always stays on the native configuration; only validation and test vary. Applied here: resample SpectralWaste's 224 FX17 bands through coarser or shifted response functions to simulate cheaper SWIR cameras (for example a 25-band snapshot mosaic, or a 12 nm-resolution instrument), and test the same checkpoint on each. This is a genuine "any camera" result, costs one afternoon of signal processing, needs no second dataset, and removes the scene-change confound that the few-shot experiment below carries. **Make this the second headline experiment.**
+3. **Few-shot new-camera adaptation.** Adapt the SpectralWaste-trained spectral path to MWIR-4-Plastic's FENIX SWIR window with K = 1, 2, 4 training cubes versus training from scratch. This confounds sensor change with scene change, so present it as the recycling-relevant "new plant, new camera, K labeled cubes" question, not as a pure sensor result.
+4. **Disjoint-range negative control.** FENIX → FX50 zero-shot, expected to collapse, reported with the physics explanation. Reviewers reward an honest, explained failure case.
 
 Two cheap controls reviewers recognize: shuffling the wavelength vector (HyperFree drops from 93.4 to 75.3 OA) and removing the wavelength PE entirely (CARL drops from 61.5 to 18.3 mIoU on mixed cameras).
 
@@ -72,7 +73,7 @@ Assumes Sep 10 start, class deliverable Dec 3–10, 2–4 people. Critical path 
 |---|---|---|---|
 | 1 | **NPU smoke test:** export the existing `SpectralStub` (C=32, 16×16) to ONNX, compile in the lab Docker with 32 random calibration cubes, run on the MLA100, inspect NPU vs CPU placement. Download SpectralWaste labeled and start MWIR-4-Plastic. | Reproduce SegFormer-B0 / CMX-B0 numbers test-only from checkpoints. Freeze the protocol document: sequence-level splits, the four band configurations, metrics (mIoU excluding background, macro-F1, relative drop). | A: NPU · B: data + baselines · C: protocol + tickets |
 | 2–3 | **Finish SSFT-Wave** (open tickets SSFT-2/3): spectral path with s=4 pooling and random band sub-sampling, spatial path, fusion, per-pixel decoder. | HSI-only training on SpectralWaste, fp16. Target: above 52.8 mIoU at under 1M params; report against PCA-3. Wrong-wavelength and no-PE controls. | B+C: model · A: calibration pipeline for 224-band cubes |
-| 4 | Index-PE and fixed-channel variants; retrain MiniNet or SegFormer-B0 on the 120-band subset with zero-fill at test. | **Configuration-shift table** on SpectralWaste, three seeds. | B: training · C: analysis |
+| 4 | Index-PE and fixed-channel variants; retrain MiniNet or SegFormer-B0 on the 120-band subset with zero-fill at test. **SRF resampler** (Gaussian response functions at target band centers and widths). | **Configuration-shift table** on SpectralWaste, three seeds, plus the **simulated-camera table** (native FX17 vs 3–4 resampled instruments, same checkpoint). | B: training · C: analysis |
 | 5 | MWIR-4-Plastic loader with a clean validation split; reproduce its ViT / SpectralFormer baselines. | Few-shot new-camera curve (K = 1, 2, 4) on the FENIX SWIR window; FX50 negative control. | C |
 | 6–7 | **Compile the full model:** static export, 32–100 calibration crops, MXQ; ONNX Runtime CPU parity harness. | **NPU table:** INT8 vs FP32 mIoU, batch-1 latency (p50/p99 over 100 runs), power via mblt-tracker, energy per frame; band drop after quantization. Apply calibration fixes if the gap exceeds 2 points. | A (+B for accuracy debugging) |
 | 8 | Ablations: fused vs spectral-only vs spatial-only; index vs wavelength vs dictionary embedding. Optional cut-line item: RGB+HSI fusion variant. | Ablation table. | B |
@@ -94,11 +95,11 @@ Critical path: week-1 compile smoke test → model complete by end of week 3 →
 ## 5. Minimum viable paper (what the course deliverable must contain)
 
 1. One dataset (SpectralWaste labeled), one compact model with a sub-1M parameter count, one like-for-like baseline (MiniNet-v2 HYPER) and one PCA-3 baseline.
-2. One configuration-shift table (in-distribution, swapped subset, disjoint complement, full 224) with relative drop, three seeds, plus the wrong-wavelength control.
+2. One configuration-shift table (in-distribution, swapped subset, disjoint complement, full 224) with relative drop, three seeds, plus the wrong-wavelength control. One simulated-camera table: the same checkpoint on 3–4 SRF-resampled instruments.
 3. One NPU table: FP32 GPU/CPU vs INT8 MLA100 mIoU, batch-1 latency, energy per frame, and band-drop robustness before and after quantization.
 4. One limitations paragraph: label-transfer ceiling, non-commercial license, no disjoint-range transfer, single sensor family.
 
-That is IGARSS-abstract or CVPR-workshop grade. Adding the few-shot new-camera curve, the FX50 negative control, and the ablations makes it an IROS 2027 submission.
+That is IGARSS-abstract or CVPR-workshop grade. Adding the few-shot new-camera curve on MWIR-4-Plastic, the FX50 negative control, and the ablations makes it an IROS 2027 submission.
 
 ## 6. Repo actions this week
 
@@ -137,3 +138,17 @@ Precedents and venues
 - HYPSO onboard hyperspectral classification accelerator (IEEE 2025). https://ieeexplore.ieee.org/document/11049208/
 - TinyCapsViT (Remote Sensing, Aug 2026). https://doi.org/10.3390/rs18162661
 - IROS 2027 deadline. https://mldeadlines.com/conference/iros-2027/ · IGARSS 2027. https://2027.ieeeigarss.org/
+
+## Appendix A. Verification status
+
+Eighteen extracted claims went to three adversarial verifiers each; seven more claims (the GeoCrossBench, SMARTIES and CARL cross-sensor findings) were queued but never voted on because the run hit a usage limit. Verifiers worked from primary artifacts (cloned repos, downloaded dataset shards, vendor guides) since arxiv.org is blocked from this environment.
+
+**Confirmed 3–0 and used as stated.** SpectralWaste split sizes and the ~25 GB / ~201 GB labeled-vs-unlabeled footprint; the FX17 sensor spec (224 bands, 900–1700 nm); the published baseline table (MiniNet-v2 HYPER 52.8 mIoU at 0.585M params, SegFormer-B0 HYPER 54.3, CMX-B0 RGB-HYPER 58.2 at 11.5M, RTX 4090 batch-1 throughput); MWIR-4-Plastic's 13 scenes, four polymers, hard-coded split and 143-band "fingerprint" baselines; HyperPlastic's disjoint 489–850 nm and 980–1670 nm ranges and its patch-classification format.
+
+**Corrected after refutation.**
+- *Wavelengths.* The claim that the FX17 band centers can be fetched from the authors' code repo was refuted 3–0: verifiers cloned both `ferpb` repos and found no wavelength vector, header, or band table anywhere, and the shard TIFFs carry no wavelength tags. The memo now says to use the nominal FX17 grid as a documented approximation or to ask the authors.
+- *RGB alignment in MWIR-4-Plastic.* "Not pixel-aligned" was refuted 2–3: the RGB cube is exactly 6× the HSI grid in both axes (3840×6684 vs 640×1114), so a stride-6 subsample lands on it. Corrected.
+- *LESSViT protocol.* Refuted 2–3, on two grounds: calling it "reviewer-accepted" overstates an unrefereed preprint, and the description was outdated. The authors' repo now adds SRF-resampled sensor configurations and real EnMAP→DESIS and EnMAP→Hyperion evaluations. This is the source of the simulated-camera experiment added in section 2.3, and is the single most valuable thing this verification pass produced.
+- *SpectralWaste distribution.* "Unlabeled data available only from OneDrive" was refuted 3–0 as an inference from omission; the 23 GB / 178 GB figures themselves hold. The memo relies on the Hugging Face release, so nothing changed.
+
+**Never verified.** The cross-sensor evidence from GeoCrossBench (2–4× collapse with no band overlap), SMARTIES (interpolation only, not extrapolation) and CARL (all cross-camera tests inside 418–2445 nm) was extracted from those papers but the verifier panels never ran. Each was read from a primary source during the search phase and the three agree with each other and with the LESSViT and HyperFree evidence that did verify, so the direction of the conclusion is well supported; treat the specific percentages as unconfirmed.
