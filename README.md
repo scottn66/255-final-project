@@ -33,6 +33,8 @@ Nine-slide briefing for class and professor (problem, gap, data, method, evaluat
 
 [docs/research/2026-09-10-project-direction-review.md](docs/research/2026-09-10-project-direction-review.md) — deep-research memo on whether to pivot: why the current framing reads as a toy, what the 2025–2026 HSI / edge-NPU landscape leaves open, four candidate directions, and a recommended proposal in the professor's outline.
 
+[docs/research/2026-09-10-feasibility-12-weeks.md](docs/research/2026-09-10-feasibility-12-weeks.md) — feasibility check of the recommended direction with sponsored NPU access: revised headline claim, week-by-week plan, top risks with cut-lines, and the minimum viable paper.
+
 ## Spike (already done)
 
 From-scratch attention + sinusoidal λ-PE + a C-agnostic spectral stub. See [2.10](bulletins/2.10-sprint-1.md).
