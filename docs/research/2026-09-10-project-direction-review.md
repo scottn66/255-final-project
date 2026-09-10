@@ -150,16 +150,25 @@ Venues and reviewer expectations
 
 ## Appendix A. Verification status of the claims this memo rests on
 
-Twenty-five extracted claims went to three independent adversarial verifiers each (a claim dies on two refutations). Every verifier worked from primary artifacts (author repos, Hugging Face mirrors, dataset cards) because arxiv.org is blocked from this environment.
+Twenty-five extracted claims went to three independent adversarial verifiers each (a claim dies on two refutations); a second pass after a usage-limit interruption re-verified most of them, so many claims carry six votes. Every verifier worked from primary artifacts (author repos, Hugging Face mirrors, dataset cards, LICENSE files) because arxiv.org is blocked from this environment.
 
-**Confirmed (used as stated).** Random-pixel leakage on single-scene HSI benchmarks, the 0.147 Macro-F1 drop and rank shifts, and the receptive-field rule (all 3–0, from the Sep 2026 preprint's abstract). LESSViT's problem statement and solution (2–1; the dissent objects only to calling the reimplementation "no new idea"). Cross-domain foundation-model transfer gains on HS3-Bench (3–0). HS3-Bench code, license, loaders, and the pseudo-RGB-beats-full-cube baseline table (3–0). BCAF's SpectralWaste numbers and model size (3–0). MWIR-4-Plastic's existence, sensors, classes and code release (2 of 3 votes in; both confirm).
+| Claim used in this memo | Votes (refuted / cast) | Outcome |
+|---|---|---|
+| Random-pixel splits put ~47.7% of test pixels next to training pixels; 0.147 Macro-F1 drop; rankings shift up to five places; separation radius must be reported against receptive field (Sep 2026 preprint) | 0 / 6, 0 / 6, 0 / 6 | Confirmed |
+| LESSViT's problem is spectral configuration shift and its solution is channel-agnostic embedding plus wavelength-aware PE | 2 / 6 | Stands (dissent objects only to "no new idea") |
+| Cross-domain transfer of a spectral foundation model beats in-domain training on HS3-Bench; the paper's stated gap is RGB-bridging discards spectra (ICPR 2026) | 0 / 6, 0 / 6 | Confirmed |
+| HS3-Bench code is MIT-licensed with loaders for HyKo2 / HSI-Drive / HCV2; pseudo-RGB DeepLabV3+ averages 64.75 mIoU vs 57.68 for RU-Net on the full cube | 0 / 3, 0 / 3 | Confirmed |
+| BCAF reaches 76.4% mIoU at 31.4 img/s on SpectralWaste (101.3M params, 282 GFLOPs); K3I-Cycling has 354 pairs | 1 / 5 | Stands ("state of the art" is self-declared) |
+| MWIR-4-Plastic: 13 co-registered RGB/VNIR/SWIR/MWIR scenes, public data and code, Zenodo 22142947 | 0 / 2 | Confirmed (third vote never ran) |
+| Laprade et al. propose wavelength encoding plus spatial-spectral masking for proximal and remote sensing | 2 / 5 | Stands, cited as an unrefereed preprint without code |
+| Crop-mapping benchmark uses cross-region and cross-sensor (EnMAP to PRISMA) evaluation | 0 / 6 | Confirmed |
 
 **Refuted or rewritten (and what changed in this memo).**
-- "SpectralWaste is CC BY 4.0" and "CMX-B0 reached 64.5% mIoU at 58.2 img/s": the LICENSE file is CC BY-NC 4.0, and the numbers were a column shift in the paper's Table IV. Corrected to 58.2% mIoU at 54.7 img/s.
-- "SSFT does not use Indian Pines or Pavia as headline evidence": false. HSI-Benchmark's remote-sensing domain is exactly those scenes plus Salinas, under random-pixel splits. Section 1 now says so.
-- "The team has already reimplemented the dual-path fusion": only the spectral stub and attention primitives exist; the spatial path is the open SSFT-2 ticket. Reuse statements were corrected.
-- "LESSViT's four-setting protocol is the 2026 evidence standard": the settings are real (C120 VNIR+, C120 SWIR+, C82 unseen, C202 expansion) but calling them a standard was an overreach. The memo cites the settings and reported drops without that framing.
-- Crop-mapping foundation-model numbers (HyperSIGMA 34.5%, DOFA 62.6%, SpectralEarth 93.5%, from-scratch 91%): the numbers are real but come from a frozen-backbone probe on one binary region pair, under review, and do not support "architecture beats pretraining". Dropped from the body.
-- "Spectral foundation models fall into two limited classes": hedged in the source and stale by 2026. Dropped.
+- "SpectralWaste is CC BY 4.0" (6 / 6 refuted) and "CMX-B0 reached 64.5% mIoU at 58.2 img/s" (6 / 6 refuted): the LICENSE file is CC BY-NC 4.0, and the numbers were a column shift in the paper's Table IV. Corrected to 58.2% mIoU at 54.7 img/s with 11.5M parameters.
+- "SSFT does not use Indian Pines or Pavia as headline evidence" (4 / 6 refuted): false. HSI-Benchmark's remote-sensing domain is exactly those scenes plus Salinas, under random-pixel splits. Section 1 now says so.
+- "The team has already reimplemented the dual-path fusion" (5 / 6 refuted): only the spectral stub and attention primitives exist; the spatial path is the open SSFT-2 ticket. Reuse statements were corrected.
+- "LESSViT's four-setting protocol is the 2026 evidence standard" (6 / 6 refuted): the settings are real (C120 VNIR+, C120 SWIR+, C82 unseen, C202 expansion) but calling them a standard was an overreach. The memo cites the settings and reported drops without that framing.
+- Crop-mapping foundation-model numbers (HyperSIGMA 34.5%, DOFA 62.6%, SpectralEarth 93.5%, from-scratch 91%; 6 / 6 and 6 / 6 refuted): the numbers are real but come from a frozen-backbone probe on one binary region pair, still under review, and do not support "architecture beats pretraining". Dropped from the body.
+- "Spectral foundation models fall into two limited classes" (6 / 6 refuted): hedged in the source and stale by 2026. Dropped.
 
-**Still pending at time of writing.** Three HyperVision claims (channel range, ground-level datasets, efficiency as open problem), the third MWIR-4-Plastic vote, and two claims about MWIR-4-Plastic's stated gap and its transformer baselines; these were interrupted by a usage limit and are being re-run. They are used in the body with the qualifier "reported" where they matter.
+**Never verified.** Three HyperVision claims (channel range 15–420 bands, ground-level evaluation datasets, efficiency named as the open problem) and two MWIR-4-Plastic detail claims (its stated gap; its tiny ViT / SpectralFormer baselines) received no completed votes before the run was stopped. Where they matter in the body they are marked "reported"; the HyperVision abstract itself was read directly and supports the channel-adaptive and ground-based framing.
