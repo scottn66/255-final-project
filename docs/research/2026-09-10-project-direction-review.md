@@ -2,6 +2,8 @@
 
 **Date:** 2026-09-10 · **Status:** research memo for the team · **Method:** deep-research workflow (5 search angles, 21 primary sources fetched, 80 claims extracted, top 25 sent to 3-vote adversarial verification; see Appendix A for what survived and what was corrected) plus a Hugging Face Hub sweep of 2025–2026 papers, datasets, and Mobilint NPU artifacts.
 
+> **Erratum (2026-09-17):** SpectralWaste was relicensed to CC BY 4.0 on 2026-09-11; references below to CC BY-NC are outdated. The statement that Mobilint's BERT tutorial required `cpu_offload` is wrong; the current tutorial compiles the encoder onto the NPU. The NPU-centered framing in this memo is superseded by [2026-09-17-architecture-focus-review.md](2026-09-17-architecture-focus-review.md).
+
 > **Bottom line.** The professor's critique holds up against the 2026 literature. Wavelength-aware positional encoding and channel-agnostic embeddings are now a standard component of at least seven published models, the dual-path fusion is copied from SSFT, and Indian Pines / Pavia results are discounted by reviewers even with block splits. But the *engineering* the team has built (from-scratch attention, wavelength PE, band-mask forward) is exactly what a stronger project needs. **Recommendation: keep the code, change the problem.** Move to sensor-agnostic hyperspectral material segmentation for robotic recycling on public multi-sensor datasets, and add the one axis nobody has measured: INT8 deployment of spectral attention on the course's Mobilint MLA100 NPU, including robustness to dropped bands *after* quantization.
 
 ---
