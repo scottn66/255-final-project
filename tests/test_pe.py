@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from pe import IndexBandPE, sinusoidal_wavelength_pe
+from sw.pe import IndexBandPE, sinusoidal_wavelength_pe
 
 
 def test_pe_shape_and_finite():
@@ -22,7 +22,7 @@ def test_pe_variable_c_without_module_rebuild():
 
 
 def test_nearby_wavelengths_are_closer_than_far():
-    """Risk 3: 800 nm closer to 810 nm than to 2100 nm in L2."""
+    """800 nm is closer to 810 nm than to 2100 nm in L2."""
     pe = sinusoidal_wavelength_pe(torch.tensor([800.0, 810.0, 2100.0]), d_model=64)
     d_near = torch.linalg.vector_norm(pe[0] - pe[1])
     d_far = torch.linalg.vector_norm(pe[0] - pe[2])

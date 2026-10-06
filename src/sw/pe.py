@@ -1,8 +1,8 @@
-"""Wavelength-aware positional encoding (LESSViT idea, sinusoidal v1).
+"""Positional encodings a band-token model can add to spectral tokens.
 
-SSFT §3.1 uses a learned table P ∈ R^{C×D} indexed by band *index*.
-We replace that with a parameter-free sinusoid of the physical wavelength.
-SSRoPE / 1D RoPE is a later stretch (LESSViT Appendix B).
+``sinusoidal_wavelength_pe`` turns a vector of wavelengths in nanometers into
+a ``(C, D)`` encoding. ``C`` is the length of the vector you pass in.
+``IndexBandPE`` is a learned table indexed by band position ``0 .. C-1``.
 """
 
 from __future__ import annotations
@@ -17,15 +17,15 @@ def sinusoidal_wavelength_pe(
     lambda_scale: float = 1000.0,
     base: float = 10000.0,
 ) -> torch.Tensor:
-    """Sinusoidal 1D PE on a wavelength vector.
+    """Sinusoidal 1D positional encoding of a wavelength vector.
 
     Args:
         wavelengths_nm: (C,) band-center wavelengths in nanometers.
         d_model: embedding width D.
-        lambda_scale: divide nm by this before the sinusoid. Default 1000
-            converts nm → microns so 400–2500 nm becomes 0.4–2.5 (PLAN.md
-            risk 3). Set to 1.0 to use raw nm.
-        base: Transformer geometric base (10000).
+        lambda_scale: divide nm by this before the sinusoid. The default 1000
+            turns nanometers into microns (400–2500 nm becomes 0.4–2.5), so
+            the angles stay in a comfortable range. Set to 1.0 to use raw nm.
+        base: geometric base used by the transformer sinusoid (10000).
 
     Returns:
         pe: (C, D) float tensor on the same device/dtype as wavelengths_nm.
@@ -49,11 +49,7 @@ def sinusoidal_wavelength_pe(
 
 
 class IndexBandPE(nn.Module):
-    """Learned integer band-index embedding P ∈ R^{C_max×D} (SSFT §3.1 baseline).
-
-    Packed 0..C-1 of the *current* tensor (PLAN.md A.3). Complementary subsets
-    of the same C therefore reuse the same rows for different wavelengths.
-    """
+    """Learned embedding of band position. Row ``i`` encodes band ``i``."""
 
     def __init__(self, n_bands: int, d_model: int):
         super().__init__()

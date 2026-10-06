@@ -1,10 +1,7 @@
-"""From-scratch attention primitives for SSFT-Wave.
+"""From-scratch multi-head attention.
 
-Implements Q/K/V, scaled dot-product, multi-head split/concat, residual+FFN,
-and cross-attention with nn.Linear + softmax only.
-
-Banned: nn.MultiheadAttention, F.multi_head_attention_forward, timm, HuggingFace
-ViT blocks. See PLAN.md (SSFT §3.1 / §3.3).
+Q, K, and V are ``nn.Linear`` layers. The scores go through ``softmax``.
+A later band-token model can reuse these blocks.
 """
 
 from __future__ import annotations
@@ -64,7 +61,7 @@ def _merge_heads(x: torch.Tensor) -> torch.Tensor:
 
 
 class MultiHeadSelfAttention(nn.Module):
-    """MHSA: Q, K, V from the same sequence. From-scratch, no nn.MultiheadAttention."""
+    """Multi-head self-attention. Q, K, and V come from the same sequence."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
@@ -98,9 +95,7 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 class MultiHeadCrossAttention(nn.Module):
-    """Cross-attention: Q from query, K/V from context. SSFT §3.3 fusion uses this
-    with spatial tokens as query and spectral tokens as key/value.
-    """
+    """Cross-attention. Queries come from one sequence, keys and values from another."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
@@ -138,7 +133,7 @@ class MultiHeadCrossAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Position-wise two-layer FFN (SSFT §3.1 / §3.3). Hidden = 4D by lock."""
+    """Position-wise two-layer feed-forward. Hidden width defaults to 4 * d_model."""
 
     def __init__(self, d_model: int, hidden: int | None = None):
         super().__init__()
@@ -151,7 +146,7 @@ class FeedForward(nn.Module):
 
 
 class ResidualSelfAttentionBlock(nn.Module):
-    """Pre-LN residual MHSA + FFN. Paper omits LN; PLAN.md locks Pre-LN."""
+    """Pre-norm residual self-attention, then a feed-forward layer."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
@@ -170,7 +165,7 @@ class ResidualSelfAttentionBlock(nn.Module):
 
 
 class ResidualCrossAttentionBlock(nn.Module):
-    """Pre-LN residual cross-attention + FFN (fusion block)."""
+    """Pre-norm residual cross-attention, then a feed-forward layer."""
 
     def __init__(self, d_model: int, n_heads: int):
         super().__init__()
