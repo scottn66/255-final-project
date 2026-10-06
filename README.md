@@ -10,7 +10,7 @@ cd 255-final-project
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 bash scripts/get_data.sh
-export SW_ROOT="$PWD/spectralwaste_segmentation"
+export SW_ROOT="$PWD/data/spectralwaste_segmentation"
 ```
 
 On Colab, skip the virtualenv and run that download in the notebook. The unpacked set is about 24 GB, so download it there instead of through Drive. Then open `notebooks/01_look_at_the_data.ipynb` and `notebooks/02_pipeline_smoke_test.ipynb`.
@@ -20,7 +20,7 @@ On Colab, skip the virtualenv and run that download in the notebook. The unpacke
 - [`docs/PLAN.md`](docs/PLAN.md) — work packages, owners, timeline
 - `scripts/get_data.sh` — download the Zenodo zip and check its md5
 - `notebooks/` — look at one cube, then a one-batch smoke test
-- `src/sw/` — dataset, metric, and the model
+- `src/sw/` — dataset loader, FG-only mIoU, and from-scratch attention / wavelength-encoding building blocks
 - `tests/` — run `pytest -q`
 
 ## How we work
