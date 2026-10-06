@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attention import (
+from sw.attention import (
     FeedForward,
     MultiHeadCrossAttention,
     MultiHeadSelfAttention,
@@ -55,7 +55,7 @@ def test_mhsa_rejects_non_divisible_heads():
 
 
 def test_cross_attention_spatial_queries_spectral_keys():
-    """SSFT §3.3: spatial tokens query, spectral tokens K/V."""
+    """Queries can be a short spatial sequence and keys a longer spectral one."""
     d, heads = 64, 4
     n_spatial, n_spectral = 4, 32
     ca = MultiHeadCrossAttention(d, heads)
@@ -68,7 +68,7 @@ def test_cross_attention_spatial_queries_spectral_keys():
 
 
 def test_one_pixel_spectrum_attends():
-    """A 1-pixel spectrum of length C attends without crash (PLAN.md spike)."""
+    """A spectrum of length C attends."""
     c, d = 17, 64
     attn = MultiHeadSelfAttention(d, n_heads=4)
     spectrum = torch.randn(1, c, d)  # N=1 spatial location
@@ -96,7 +96,7 @@ def test_ffn_shape():
 
 def test_no_banned_attention_modules():
     """The implementation must not wrap nn.MultiheadAttention."""
-    import attention as m
+    import sw.attention as m
 
     src = open(m.__file__, encoding="utf-8").read()
     assert "nn.MultiheadAttention(" not in src
