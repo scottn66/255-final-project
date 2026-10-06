@@ -1,10 +1,6 @@
 # SpectralWaste segmentation — DATA 255 Group 1
 
-We are building a transformer from scratch that turns hyperspectral bands into tokens and labels each pixel as one of six waste classes. We train on SpectralWaste (one camera, [Zenodo 10880544](https://zenodo.org/records/10880544)) and score mean IoU over those six classes only; background is left out. The hyperspectral-only numbers to compare against are 52.8 (MiniNet-v2) and 54.3 (SegFormer-B0). Next we fuse spectral and spatial features, then try INT8 on the course NPU.
-
-**Group:** Scott Nelson, Surya Reddy, Tim Wada, Prakhar, Yash. SJSU DATA 255, Fall 2026.
-
-**Status:** Topic approved by Jeong in writing; confirmed verbally with Mamta. Data verified: 514 train / 167 val / 171 test.
+**Group 1 (Scott, Surya, Tim, Prakhar, Yash).** We segment jam objects on a recycling line using the SpectralWaste hyperspectral dataset ([Casao et al., IROS 2024](https://arxiv.org/abs/2403.18033)). That's 224 bands from 900 to 1700 nm, 6 object classes plus background, and the official 514/167/171 split. We build a small spectral–spatial transformer from scratch in three phases: (1) a minimal transformer that segments the hyperspectral images, (2) spectral–spatial fusion with ablations, and (3) INT8 quantization for portable or NPU deployment, where we measure how much mIoU drops. We report mIoU over the 6 object classes. Our bar is the published hyperspectral-only results, MiniNet-v2 at 52.8 and SegFormer-B0 at 54.3. CMX-B0's 58.2 uses RGB and hyperspectral together, so we cite it as context, not as a target. Topic approved by Jeong; confirmed verbally with Mamta.
 
 ## Start here
 

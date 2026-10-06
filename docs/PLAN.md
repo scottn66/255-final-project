@@ -4,16 +4,15 @@ Updated Tue Oct 6, 2026. Group: Scott Nelson, Surya Reddy, Tim Wada, Prakhar, Ya
 
 ## Where we are
 
-- Topic locked: semantic segmentation of SpectralWaste hyperspectral cubes with a transformer we build ourselves (no pretrained weights). Approved by Jeong in writing; confirmed verbally with Mamta (Jeong's written OK is Sep 22).
-- Data: Zenodo record 10880544, `spectralwaste_segmentation.zip`, 23 GB, md5 `ae2c268bb385345f12e55b4389d2d3b9`. Checked on the real files: 514 train / 167 val / 171 test. Cubes are 224 bands × 256 × 256. Masks use classes 0–6 (0 = background).
-- Metric: mean IoU averaged over the 6 object classes only (background excluded). The hyperspectral-only bar is 52.8–54.3: MiniNet-v2 HYPER 52.8 and SegFormer-B0 HYPER 54.3. CMX-B0 (58.2) uses RGB plus hyperspectral, so cite it as context only.
-- Wavelength encoding already in the tree is a building block. It is not the claim.
+- We segment jam objects on a recycling line with a small spectral–spatial transformer we build from scratch (no pretrained weights). Topic approved by Jeong; confirmed verbally with Mamta.
+- Data: Zenodo record 10880544, `spectralwaste_segmentation.zip` ([Casao et al., IROS 2024](https://arxiv.org/abs/2403.18033)), 23 GB, md5 `ae2c268bb385345f12e55b4389d2d3b9`. Checked on the real files: 514 train / 167 val / 171 test. Cubes are 224 bands from 900 to 1700 nm, stored 224 × 256 × 256. Masks use classes 0–6 (0 = background, 6 object classes).
+- Metric: mIoU over the 6 object classes. Our bar is the published hyperspectral-only results, MiniNet-v2 at 52.8 and SegFormer-B0 at 54.3. CMX-B0's 58.2 uses RGB and hyperspectral together, so we cite it as context, not as a target.
 
 ## Phases
 
-1. **Phase 1.** From-scratch band-token transformer and a segmentation head, official split, honest test mean IoU with per-class scores. **Nov 4 checkup target:** a CNN control score, plus the transformer training on real data. Any transformer score is a bonus. A v1 below 52.8 (or below the CNN) is a normal from-scratch result on 514 images.
-2. **Phase 2.** Spectral–spatial fusion and ablations (spectral-only / spatial-only / fused).
-3. **Phase 3.** INT8 quantization and NPU latency versus float. This is the novelty claim.
+1. **Phase 1.** A minimal transformer that segments the hyperspectral images, on the official split, with an honest test mIoU and per-class scores. **Nov 4 checkup target:** a CNN control score, plus the transformer training on real data. Any transformer score is a bonus. A v1 below 52.8 (or below the CNN) is a normal from-scratch result on 514 images.
+2. **Phase 2.** Spectral–spatial fusion with ablations (spectral-only / spatial-only / fused).
+3. **Phase 3.** INT8 quantization for portable or NPU deployment. We measure how much mIoU drops.
 
 ## Work packages and suggested owners
 
@@ -54,6 +53,6 @@ Swap owners freely.
 
 - Masks are named `<stem>.png` next to `<stem>.tiff`. There are no `*semantic.png` files, so a loader that expects that suffix will crash. Pair cubes and masks by sorted stem.
 - Classes, from `meta.json`: 0 background, 1 film, 2 basket, 3 cardboard, 4 video_tape, 5 filament, 6 bag.
-- Cubes are uint16, band-first `(224, 256, 256)`. Read them with `tifffile`. Scale to float32 in [0, 1] by dividing by 65535.
+- Cubes are uint16, band-first `(224, 256, 256)`, 900 to 1700 nm. Read them with `tifffile`. Scale to float32 in [0, 1] by dividing by 65535.
 - Class weights must come from the `labels_hyper_lt` train counts `[27612233, 1819248, 1060150, 220623, 397471, 33101, 2542678]`, not the official repo's RGB counts. `meta.json` `categories_pixel_counts` are the RGB-label counts. The results slide should say so in one sentence: the paper weighted hyperspectral runs with RGB-label counts.
 - License: CC BY 4.0. Download: <https://zenodo.org/records/10880544/files/spectralwaste_segmentation.zip?download=1>
