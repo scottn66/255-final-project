@@ -1,29 +1,34 @@
-# DATA 255 final project (Group 10)
+# SpectralWaste segmentation — DATA 255 Group 1
 
-**Current claim (pending Jeong / Mamta):** can a hyperspectral model that takes physical wavelength as a runtime input keep that flexibility after **INT8 quantization and ARIES compilation**, so one quantized binary can serve more than one camera?
+We are building a transformer from scratch that turns hyperspectral bands into tokens and labels each pixel as one of six waste classes. We train on SpectralWaste (one camera, [Zenodo 10880544](https://zenodo.org/records/10880544)) and score mean IoU over those six classes only; background is left out. The hyperspectral-only numbers to compare against are 52.8 (MiniNet-v2) and 54.3 (SegFormer-B0). Next we fuse spectral and spatial features, then try INT8 on the course NPU.
 
-→ Start at **[`docs/research/`](docs/research/README.md)** (SpectralWaste plastics sorting + edge quantization).
+**Group:** Scott Nelson, Surya Reddy, Tim Wada, Prakhar, Yash. SJSU DATA 255, Fall 2026.
 
-Group: Scott Nelson, Surya Reddy, Tim Wada · SJSU DATA 255 Fall 2026.
+**Status:** Topic approved by Jeong in writing; confirmed verbally with Mamta. Data verified: 514 train / 167 val / 171 test.
 
-## What changed
-
-The Sep 9 class intro framed **SSFT-Wave** on academic HSI (Indian Pines band-drop vs a fixed-C ViT). Instructor feedback pushed us to a **narrower, hardware-facing claim**: industrial plastic HSI, and whether sensor-agnosticism survives INT8 on Mobilint ARIES. Details live in [`docs/research/`](docs/research/README.md).
-
-## Still in the repo (prior framing)
-
-| Path | Role |
-|------|------|
-| [`docs/research/`](docs/research/README.md) | **Current** proposal notes |
-| [`PLAN.md`](PLAN.md) / [`bulletins/`](bulletins/README.md) | Earlier SSFT-Wave / Indian Pines plan + sprint board |
-| [`docs/SSFT-Wave_class_intro.pptx`](docs/SSFT-Wave_class_intro.pptx) | Sep 9 class intro deck (historical) |
-| [`src/`](src/) | From-scratch attention / λ-PE spike (architecture scaffolding) |
-
-Do **not** treat Indian Pines download or full training as the next step until the Week 5 compile smoke test and instructor reply.
-
-## Spike tests
+## Start here
 
 ```bash
-source .venv/bin/activate   # python 3.12, torch + pytest + numpy
-pytest -q
+git clone https://github.com/scottn66/255-final-project.git
+cd 255-final-project
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+bash scripts/get_data.sh
+export SW_ROOT="$PWD/spectralwaste_segmentation"
 ```
+
+On Colab, skip the virtualenv and run that download in the notebook. The unpacked set is about 24 GB, so download it there instead of through Drive. Then open `notebooks/01_look_at_the_data.ipynb` and `notebooks/02_pipeline_smoke_test.ipynb`.
+
+## Repo map
+
+- [`docs/PLAN.md`](docs/PLAN.md) — work packages, owners, timeline
+- `scripts/get_data.sh` — download the Zenodo zip and check its md5
+- `notebooks/` — look at one cube, then a one-batch smoke test
+- `src/sw/` — dataset, metric, and the model
+- `tests/` — run `pytest -q`
+
+## How we work
+
+One branch per work package, small pull requests, one teammate review. Never commit the dataset, its images, zips, or checkpoints. The loader reads the data path from `SW_ROOT`.
+
+Full plan: [`docs/PLAN.md`](docs/PLAN.md).

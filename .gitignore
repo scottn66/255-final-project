@@ -2,10 +2,16 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-data/*.mat
-data/*.npy
 .DS_Store
-docs/node_modules/
-docs/package-lock.json
-docs/slides_preview/
-docs/unpacked/
+
+# Dataset and run artifacts. Masks are PNGs inside these folders;
+# do not ignore *.png globally (notebook and docs images stay committable).
+data/
+spectralwaste_segmentation/
+*.tiff
+*.tif
+*.zip
+checkpoints/
+runs/
+outputs/
+.ipynb_checkpoints/
