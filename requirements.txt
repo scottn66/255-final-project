@@ -1,3 +1,11 @@
-torch
-pytest
-numpy
+# Python 3.11+. Lower bounds only.
+# On Colab, pip leaves the preinstalled torch in place when these are already met.
+# Do not pin torch==2.2.2 or numpy<2; those pins fail on current Colab / Python 3.13.
+torch>=2.2
+torchvision>=0.17
+numpy>=1.26
+tifffile>=2023.7.10
+pillow>=10.0
+matplotlib>=3.7
+jupyter>=1.0
+pytest>=7.4
