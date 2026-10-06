@@ -8,6 +8,15 @@
 # folder is about 24 GB. Re-run the same command to resume a partial download.
 set -euo pipefail
 
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is not installed. Install curl, then re-run this script." >&2
+  exit 1
+fi
+if ! command -v unzip >/dev/null 2>&1; then
+  echo "unzip is not installed. Install unzip, then re-run this script." >&2
+  exit 1
+fi
+
 URL="https://zenodo.org/records/10880544/files/spectralwaste_segmentation.zip?download=1"
 EXPECTED_MD5="ae2c268bb385345f12e55b4389d2d3b9"
 DEST="${1:-./data}"
@@ -65,8 +74,11 @@ fi
 
 echo
 echo "Done. In a shell:"
-echo "export SW_ROOT=$ROOT"
+echo "export SW_ROOT=\"$ROOT\""
 echo
 echo "In Python or Colab:"
 echo "import os"
 echo "os.environ[\"SW_ROOT\"] = \"$ROOT\""
+echo
+echo "The zip is about 21 GB. You can delete it now (keeping it and the unpacked data uses about 45 GB):"
+echo "  rm \"$ZIP\""
