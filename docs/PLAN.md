@@ -29,6 +29,14 @@ Swap owners freely.
 | WP7 | Experiments + results table | Runs WP5 and WP6 through WP3, tunes band-group size and width, fills the table vs 52.8 / 54.3 (58.2 as context) | Tim + Prakhar |
 | WP8 | Checkup deck + writeup | Nov 4 slides: problem, data, model diagram tied to lecture topics, mean IoU table, failure notes, Phase 2/3 plan. Vision research drafts the related-work and baseline slide | Surya + Scott |
 
+## Built-in layers, the model we report, and the Nov 4 slides
+
+Jeong said built-in PyTorch transformer pieces are OK, and customization is preferred. WP6 may start from `nn.TransformerEncoderLayer` so we have a working model quickly. `torch.nn.functional.scaled_dot_product_attention` is fine inside our own block.
+
+The model we report as ours must use our own band tokenizer (WP5) and the attention block in `src/sw/attention.py`, because the README claims a transformer built from scratch. The built-in `nn.TransformerEncoderLayer` version stays a starting point and a comparison row (built-in vs custom block), which is also an ablation. If that built-in version ends up as the reported model, tell Vision research and change the claim to "trained from scratch with a custom spectral tokenizer" first.
+
+No lecture before the Nov 4 checkup covers attention or transformers. The syllabus deducts for content that was not covered in class, so tie band tokens and the wavelength encoding to the ViT-components slide in Lecture 1 (patch embedding, position embedding, class token). Segmentation and mIoU are covered in Lecture 9 (Oct 21). A fuller lecture map is coming as a separate doc.
+
 ## Timeline
 
 | Week | Goal |
