@@ -28,7 +28,8 @@ def _write_split(root, split, stems, shape=(4, 8, 8)):
         cube[0, 0, 0] = 0
         cube[0, 0, -1] = 65535
         cube[0, 0, 1] = 1000 * (i + 1)  # unique, and not symmetric left-right
-        tifffile.imwrite(hyper / f"{stem}.tiff", cube)
+        # photometric avoids tifffile treating a small C as an RGB image.
+        tifffile.imwrite(hyper / f"{stem}.tiff", cube, photometric="minisblack")
         mask = np.zeros((h, w), dtype=np.uint8)
         mask[:, :] = i % 7
         mask[0, 0] = 0
@@ -63,9 +64,10 @@ def test_pairs_by_stem_in_sorted_order(tmp_path):
     assert stems == ["a_sample", "b_sample"]
     for cube_path, mask_path in ds.pairs:
         assert cube_path.stem == mask_path.stem
-    # The stored marker differs per file, so index 0 is a_sample (1000), not b_sample.
+    # Written as b_sample, then a_sample. Sorted order still returns a_sample first,
+    # and that file was the second one written (marker 2000).
     cube, _mask = ds[0]
-    assert cube[0, 0, 1].item() == pytest.approx(1000 / 65535)
+    assert cube[0, 0, 1].item() == pytest.approx(2000 / 65535)
 
 
 def test_unmatched_stem_raises(tmp_path):
