@@ -15,6 +15,8 @@ export SW_ROOT="$PWD/data/spectralwaste_segmentation"
 
 On Colab, skip the virtualenv and run that download in the notebook. The unpacked set is about 24 GB, so download it there instead of through Drive. Then open `notebooks/01_look_at_the_data.ipynb` and `notebooks/02_pipeline_smoke_test.ipynb`.
 
+Outputs are saved, so you can read them on GitHub before downloading the data. The committed notebooks show outputs from a real-data run on Oct 6, 2026; re-run them with `SW_ROOT` set to refresh.
+
 ## Repo map
 
 - [`docs/PLAN.md`](docs/PLAN.md) — work packages, owners, timeline
