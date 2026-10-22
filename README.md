@@ -13,6 +13,8 @@ bash scripts/get_data.sh
 export SW_ROOT="$PWD/data/spectralwaste_segmentation"
 ```
 
+Train the CNN control with `PYTHONPATH=src python -m sw.train --smoke` (two CPU steps). A real run is `PYTHONPATH=src python -m sw.train --epochs 30 --batch-size 4 --out-dir runs/cnn` on a Colab GPU. Disk layout and resume are in [`docs/COLAB.md`](docs/COLAB.md).
+
 On Colab, skip the virtualenv and run that download in the notebook. The unpacked set is about 24 GB, so download it there instead of through Drive. Then open `notebooks/01_look_at_the_data.ipynb` and `notebooks/02_pipeline_smoke_test.ipynb`.
 
 Outputs are saved, so you can read them on GitHub before downloading the data. The committed notebooks show outputs from a real-data run on Oct 6, 2026; re-run them with `SW_ROOT` set to refresh.
@@ -22,7 +24,7 @@ Outputs are saved, so you can read them on GitHub before downloading the data. T
 - [`docs/PLAN.md`](docs/PLAN.md) — work packages, owners, timeline
 - `scripts/get_data.sh` — download the Zenodo zip and check its md5
 - `notebooks/` — look at one cube, then a one-batch smoke test
-- `src/sw/` — dataset loader, FG-only mIoU, and from-scratch attention / wavelength-encoding building blocks
+- `src/sw/` — dataset loader, FG-only mIoU, from-scratch attention / wavelength-encoding building blocks, the CNN control, and `python -m sw.train`
 - `tests/` — run `pytest -q`
 
 ## How we work

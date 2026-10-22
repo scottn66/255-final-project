@@ -137,9 +137,48 @@ def test_class_table_and_weights():
     )
     assert HYPER_LT_TRAIN_PIXEL_COUNTS[0] == 27612233
     assert HYPER_LT_TRAIN_PIXEL_COUNTS[5] == 33101  # filament, the rare class
-    weights = class_weights()
+    # Mean-1 inverse frequency is still available. The default scheme is
+    # "paper"; test_paper_class_weights_are_the_default checks that.
+    weights = class_weights(scheme="inverse")
     assert weights.shape == (7,)
     assert weights.dtype == torch.float32
     assert torch.allclose(weights.mean(), torch.tensor(1.0), atol=1e-5)
     # Fewer pixels -> larger weight. Filament is rarer than background.
     assert weights[5] > weights[0]
+
+
+def test_paper_class_weights_are_the_default():
+    """SpectralWaste scheme on the hyperspectral train counts.
+
+    w_c = (median(f) / f_c) ** 0.12, f = counts / counts.sum().
+    The published rounded vector is the contract for the training default.
+    """
+    expected = torch.tensor(
+        [0.676, 0.937, 1.000, 1.207, 1.125, 1.516, 0.900],
+        dtype=torch.float32,
+    )
+    weights = class_weights()
+    assert class_weights(scheme="paper").tolist() == weights.tolist()
+    assert weights.shape == (7,)
+    assert weights.dtype == torch.float32
+    assert torch.allclose(weights, expected, atol=1e-3, rtol=0.0)
+    # Basket (index 2) is the median frequency, so its weight is exactly 1.
+    assert weights[2].item() == pytest.approx(1.0)
+    # Still monotone in rarity, just a much smaller spread than inverse frequency.
+    assert weights[5] > weights[0]
+    inverse = class_weights(scheme="inverse")
+    assert (weights.max() / weights.min()) < (inverse.max() / inverse.min())
+
+
+def test_paper_formula_on_a_tiny_count_vector():
+    counts = [1, 2, 4]
+    weights = class_weights(counts, scheme="paper")
+    freq = torch.tensor(counts, dtype=torch.float32)
+    fraction = freq / freq.sum()
+    expected = (fraction.median() / fraction) ** 0.12
+    assert torch.allclose(weights, expected)
+
+
+def test_unknown_weight_scheme_raises():
+    with pytest.raises(ValueError, match="scheme"):
+        class_weights(scheme="rgb")

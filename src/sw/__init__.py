@@ -3,6 +3,11 @@
 Import the dataset, the foreground mIoU meter, or the attention blocks:
 
     from sw import SpectralWasteDataset, class_weights, ConfusionMeter
+
+The CNN control is ``MiniNetSeg`` (imported on demand, so this package stays
+light):
+
+    from sw import MiniNetSeg
 """
 
 from sw.attention import (
@@ -40,4 +45,15 @@ __all__ = [
     "ResidualCrossAttentionBlock",
     "sinusoidal_wavelength_pe",
     "IndexBandPE",
+    "MiniNetSeg",
 ]
+
+
+def __getattr__(name):
+    # Lazy so ``python -m sw.models.cnn`` can print the parameter count
+    # without this package importing the model first.
+    if name == "MiniNetSeg":
+        from sw.models.cnn import MiniNetSeg
+
+        return MiniNetSeg
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
