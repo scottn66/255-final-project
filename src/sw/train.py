@@ -2,7 +2,9 @@
 
 ``train(model, cfg)`` runs AdamW and weighted cross-entropy, reports
 foreground mIoU on the validation split after every epoch, and writes
-``best.pt``, ``metrics.jsonl``, and ``metrics.csv`` under ``cfg.out_dir``.
+``best.pt``, ``last.pt``, ``metrics.jsonl``, and ``metrics.csv`` under
+``cfg.out_dir``. ``last.pt`` is the resume file (model, optimizer,
+scheduler, epoch, best foreground mIoU). ``best.pt`` is the best weights.
 
 Run it from the repo root:
 
@@ -13,8 +15,9 @@ Run it from the repo root:
 wiring check. The number it prints is not a result to put on a slide.
 
 A full run reads every cube from disk each epoch (about 24 GB unzipped).
-That is a Colab GPU job. ``SW_ROOT`` must point at the folder that contains
-``hyper/`` and ``labels_hyper_lt/``.
+That is a Colab GPU job. Put the cubes on local disk and the checkpoints
+on Drive. The commands are in ``docs/COLAB.md``. ``SW_ROOT`` must point at
+the folder that contains ``hyper/`` and ``labels_hyper_lt/``.
 """
 
 from __future__ import annotations
@@ -54,10 +57,15 @@ class TrainConfig:
 
     ``device`` is ``"auto"`` (cuda, then mps, then cpu) or one of those names.
 
-    The ``max_*`` fields are how ``--smoke`` shortens a run. ``None`` means
-    the whole split and every batch. ``patience`` stops after that many
-    epochs without a better validation foreground mIoU. ``None`` runs every
-    epoch.
+    The ``max_*`` fields shorten a run. ``None`` means the whole split and
+    every batch. ``--smoke`` sets them when the CLI flags are left unset.
+    ``patience`` stops after that many epochs without a better validation
+    foreground mIoU. ``None`` runs every requested epoch.
+
+    ``cosine`` anneals the learning rate with ``CosineAnnealingLR`` over
+    ``epochs``. ``amp`` turns on CUDA mixed precision. On cpu or mps it is
+    ignored and a line is printed. ``resume`` is a ``last.pt`` path; training
+    continues at the next epoch and the metrics files are appended.
     """
 
     data_root: str | None = None
@@ -76,6 +84,9 @@ class TrainConfig:
     max_val_images: int | None = None
     max_train_steps: int | None = None
     patience: int | None = None
+    cosine: bool = True
+    amp: bool = False
+    resume: str | None = None
 
 
 def resolve_device(name: str) -> torch.device:
@@ -177,11 +188,20 @@ def _seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
-def _loader(dataset, cfg: TrainConfig, shuffle: bool, pin_memory: bool) -> DataLoader:
+def _train_drop_last(n_images: int, batch_size: int) -> bool:
+    """True when the last training batch would contain a single image.
+
+    BatchNorm cannot estimate a variance from one image. ``drop_last`` on the
+    loader leaves that image out. A tail of 2 or more images is kept.
+    """
+    if n_images < batch_size:
+        return False
+    return n_images % batch_size == 1
+
+
+def _loader(dataset, cfg: TrainConfig, shuffle: bool, pin_memory: bool, drop_last: bool) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(cfg.seed)
-    # A trailing batch of 1 image breaks BatchNorm in train mode.
-    drop_last = shuffle and len(dataset) % cfg.batch_size == 1 and len(dataset) > cfg.batch_size
     return DataLoader(
         dataset,
         batch_size=cfg.batch_size,
@@ -226,14 +246,93 @@ def _evaluate(model, loader, device) -> tuple[float, dict]:
 def _check_cfg(cfg: TrainConfig) -> None:
     if cfg.epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {cfg.epochs}")
-    if cfg.batch_size < 1:
-        raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}")
+    if cfg.batch_size < 2:
+        raise ValueError(
+            f"batch_size must be >= 2 so BatchNorm does not train on a batch of 1, got {cfg.batch_size}"
+        )
     if cfg.downsample < 1:
         raise ValueError(f"downsample must be >= 1, got {cfg.downsample}")
     if cfg.lr <= 0:
         raise ValueError(f"lr must be > 0, got {cfg.lr}")
     if cfg.weight_scheme not in ("paper", "inverse"):
         raise ValueError(f"weight_scheme must be 'paper' or 'inverse', got {cfg.weight_scheme!r}")
+    for name in ("max_train_images", "max_val_images", "max_train_steps"):
+        value = getattr(cfg, name)
+        if value is not None and value < 1:
+            raise ValueError(f"{name} must be >= 1, got {value}")
+    if cfg.resume is not None and not Path(cfg.resume).is_file():
+        raise FileNotFoundError(f"resume checkpoint does not exist: {cfg.resume}")
+
+
+def _log_mode(path: Path, resume: bool) -> str:
+    """Append a metrics file on resume. A new run replaces it."""
+    if resume and path.is_file() and path.stat().st_size > 0:
+        return "a"
+    return "w"
+
+
+def _save_last(path, model, optimizer, scheduler, scaler, epoch, best, best_epoch, stall, cfg, weights, use_amp):
+    """Resume checkpoint. ``best.pt`` stays the best weights only."""
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": None if scheduler is None else scheduler.state_dict(),
+        "epoch": epoch,
+        "best_val_fg_miou": None if best_epoch is None else best,
+        "best_epoch": best_epoch,
+        "stall": stall,
+        "class_weight_scheme": cfg.weight_scheme,
+        "class_weights": [float(value) for value in weights.detach().cpu().tolist()],
+        "cfg": asdict(cfg),
+    }
+    if use_amp:
+        payload["scaler"] = scaler.state_dict()
+    torch.save(payload, path)
+    print(f"saved {path}  (epoch {epoch})")
+
+
+def _load_resume(path, model, optimizer, scheduler, scaler, device, use_amp) -> dict:
+    """Restore a ``last.pt`` and return where the next epoch should start."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    if "model" not in ckpt or "epoch" not in ckpt:
+        raise KeyError(f"{path} is missing 'model' or 'epoch'")
+    if "optimizer" not in ckpt:
+        raise KeyError(
+            f"{path} has weights but no optimizer. Resume from last.pt "
+            "(best.pt is the best weights only)."
+        )
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    if scheduler is None:
+        if ckpt.get("scheduler") is not None:
+            print("cosine is off for this run; not restoring the scheduler")
+    elif ckpt.get("scheduler") is not None:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    else:
+        print("checkpoint has no scheduler; cosine restarts from the base learning rate")
+    if use_amp and scaler is not None and ckpt.get("scaler"):
+        scaler.load_state_dict(ckpt["scaler"])
+    elif use_amp:
+        print("checkpoint has no GradScaler state; mixed precision starts fresh")
+    finished = int(ckpt["epoch"])
+    raw_best = ckpt.get("best_val_fg_miou")
+    if raw_best is None:
+        best = -math.inf
+        best_epoch = None
+    else:
+        best = float(raw_best)
+        best_epoch = ckpt.get("best_epoch")
+    shown = "none" if best_epoch is None else f"{best:.4f}"
+    print(
+        f"resumed {path}  finished epoch {finished}  "
+        f"next epoch {finished + 1}  best val FG mIoU {shown}"
+    )
+    return {
+        "start_epoch": finished + 1,
+        "best": best,
+        "best_epoch": best_epoch,
+        "stall": int(ckpt.get("stall", 0)),
+    }
 
 
 def train(model: nn.Module, cfg: TrainConfig) -> dict:
@@ -258,20 +357,46 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
         raise RuntimeError(
             "Need at least 2 training images. BatchNorm cannot train on a batch of 1."
         )
+    drop_last = _train_drop_last(len(train_ds), cfg.batch_size)
+    if drop_last:
+        print(
+            "train loader drop_last: leaving out 1 image "
+            "so BatchNorm does not train on a batch of 1"
+        )
     pin_memory = device.type == "cuda"
-    train_loader = _loader(train_ds, cfg, shuffle=True, pin_memory=pin_memory)
-    val_loader = _loader(val_ds, cfg, shuffle=False, pin_memory=pin_memory)
+    train_loader = _loader(train_ds, cfg, shuffle=True, pin_memory=pin_memory, drop_last=drop_last)
+    val_loader = _loader(val_ds, cfg, shuffle=False, pin_memory=pin_memory, drop_last=False)
 
     weights = class_weights(scheme=cfg.weight_scheme).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = None
+    if cfg.cosine:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+    use_amp = bool(cfg.amp) and device.type == "cuda"
+    if cfg.amp and not use_amp:
+        print(f"amp applies to cuda only; device is {device.type}, training in full precision")
+    # enabled=False is a no-op, so cpu and mps take the same step as a plain backward.
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    best = -math.inf
+    best_epoch = None
+    stall = 0
+    start_epoch = 1
+    if cfg.resume:
+        restored = _load_resume(cfg.resume, model, optimizer, scheduler, scaler, device, use_amp)
+        start_epoch = restored["start_epoch"]
+        best = restored["best"]
+        best_epoch = restored["best_epoch"]
+        stall = restored["stall"]
 
     n_params = count_parameters(model)
     limited = cfg.max_train_steps is not None or cfg.max_train_images is not None
+    schedule = "cosine" if scheduler is not None else "constant"
     print(f"{model.__class__.__name__} parameters: {n_params:,} ({n_params / 1e6:.3f}M)")
     print(
-        f"device {device}  epochs {cfg.epochs}  batch {cfg.batch_size}  "
-        f"lr {cfg.lr}  weight_decay {cfg.weight_decay}"
+        f"device {device}  epochs {start_epoch}-{cfg.epochs}  batch {cfg.batch_size}  "
+        f"lr {cfg.lr}  weight_decay {cfg.weight_decay}  schedule {schedule}  amp {'on' if use_amp else 'off'}"
     )
     print(
         f"train images {len(train_ds)}  val images {len(val_ds)}  "
@@ -284,30 +409,43 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
 
     jsonl_path = out_dir / "metrics.jsonl"
     csv_path = out_dir / "metrics.csv"
-    fieldnames = ["epoch", "train_loss", "val_fg_miou", "steps", *[f"iou_{name}" for name in CLASS_NAMES]]
-    best = -math.inf
-    best_epoch = None
-    stall = 0
-    epochs_ran = 0
+    if start_epoch > cfg.epochs:
+        print(
+            f"checkpoint already finished epoch {start_epoch - 1}; "
+            f"--epochs is {cfg.epochs}. Nothing to run."
+        )
+        return _result(best, best_epoch, start_epoch - 1, n_params, out_dir, jsonl_path)
 
-    with jsonl_path.open("w", encoding="utf-8") as jsonl_file, csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+    fieldnames = ["epoch", "train_loss", "val_fg_miou", "steps", *[f"iou_{name}" for name in CLASS_NAMES]]
+    epochs_ran = start_epoch - 1
+    jsonl_mode = _log_mode(jsonl_path, cfg.resume is not None)
+    csv_mode = _log_mode(csv_path, cfg.resume is not None)
+
+    with jsonl_path.open(jsonl_mode, encoding="utf-8") as jsonl_file, csv_path.open(
+        csv_mode, newline="", encoding="utf-8"
+    ) as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        for epoch in range(1, cfg.epochs + 1):
+        if csv_mode == "w":
+            writer.writeheader()
+        for epoch in range(start_epoch, cfg.epochs + 1):
             model.train()
             loss_sum = 0.0
             seen = 0
             steps = 0
             for cubes, masks in train_loader:
                 if cubes.shape[0] < 2:
-                    # BatchNorm variance is undefined for a single image.
-                    continue
+                    raise RuntimeError(
+                        f"training batch has {cubes.shape[0]} image(s); "
+                        "BatchNorm needs at least 2. The train loader should have dropped this tail."
+                    )
                 cubes = cubes.to(device)
                 masks = masks.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                loss = criterion(model(cubes), masks)
-                loss.backward()
-                optimizer.step()
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                    loss = criterion(model(cubes), masks)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 loss_sum += float(loss.item()) * cubes.shape[0]
                 seen += cubes.shape[0]
                 steps += 1
@@ -339,9 +477,14 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
             writer.writerow(row)
             csv_file.flush()
             shown = "nan" if math.isnan(score) else f"{score:.4f}"
-            print(f"epoch {epoch:02d}  steps {steps:4d}  train_loss {train_loss:.4f}  val_fg_miou {shown}")
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(
+                f"epoch {epoch:02d}  steps {steps:4d}  lr {current_lr:.6g}  "
+                f"train_loss {train_loss:.4f}  val_fg_miou {shown}"
+            )
 
-            if math.isfinite(score) and score > best:
+            improved = math.isfinite(score) and score > best
+            if improved:
                 best = score
                 best_epoch = epoch
                 stall = 0
@@ -360,10 +503,30 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 print(f"saved {out_dir / 'best.pt'}  (epoch {epoch}, val FG mIoU {score:.4f})")
             else:
                 stall += 1
-                if cfg.patience is not None and stall >= cfg.patience:
-                    print(f"early stop at epoch {epoch} (patience {cfg.patience})")
-                    break
+            if scheduler is not None:
+                scheduler.step()
+            _save_last(
+                out_dir / "last.pt",
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                best,
+                best_epoch,
+                stall,
+                cfg,
+                weights,
+                use_amp,
+            )
+            if not improved and cfg.patience is not None and stall >= cfg.patience:
+                print(f"early stop at epoch {epoch} (patience {cfg.patience})")
+                break
 
+    return _result(best, best_epoch, epochs_ran, n_params, out_dir, jsonl_path)
+
+
+def _result(best, best_epoch, epochs_ran, n_params, out_dir, jsonl_path) -> dict:
     result = {
         "best_val_fg_miou": None if best_epoch is None else best,
         "best_epoch": best_epoch,
@@ -411,6 +574,39 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Stop after this many epochs without a better val FG mIoU.",
     )
+    parser.add_argument(
+        "--max-train-images",
+        type=int,
+        default=None,
+        help="Use only the first N training images. Default: all, or 4 with --smoke.",
+    )
+    parser.add_argument(
+        "--max-val-images",
+        type=int,
+        default=None,
+        help="Use only the first N validation images. Default: all, or 2 with --smoke.",
+    )
+    parser.add_argument(
+        "--max-train-steps",
+        type=int,
+        default=None,
+        help="Stop each epoch after this many optimizer steps. Default: all, or 2 with --smoke.",
+    )
+    parser.add_argument(
+        "--no-cosine",
+        action="store_true",
+        help="Constant learning rate. The default is CosineAnnealingLR over --epochs.",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Mixed precision on CUDA (autocast + GradScaler). Ignored on cpu and mps.",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="last.pt from an interrupted run. Continues at the next epoch and appends the metrics log.",
+    )
     parser.add_argument("--in-channels", type=int, default=224, help="Bands in the cube. Real data is 224.")
     parser.add_argument(
         "--smoke",
@@ -454,10 +650,13 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         device=args.device,
         out_dir=out_dir,
         weight_scheme=args.weight_scheme,
-        max_train_images=4 if smoke else None,
-        max_val_images=2 if smoke else None,
-        max_train_steps=2 if smoke else None,
+        max_train_images=4 if smoke and args.max_train_images is None else args.max_train_images,
+        max_val_images=2 if smoke and args.max_val_images is None else args.max_val_images,
+        max_train_steps=2 if smoke and args.max_train_steps is None else args.max_train_steps,
         patience=args.patience,
+        cosine=not args.no_cosine,
+        amp=bool(args.amp),
+        resume=args.resume,
     )
 
 

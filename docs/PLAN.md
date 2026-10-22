@@ -78,7 +78,7 @@ Every pull request on `main` in this window was merged by Scott. Surya, Tim, Pra
 ## What rev 3 adds in the code
 
 - `class_weights()` defaults to the SpectralWaste scheme `w_c = (median(f) / f_c) ** 0.12`. `class_weights(scheme="inverse")` is the old mean-1 inverse frequency.
-- `python -m sw.train` (same flags as `python scripts/train.py`) trains with AdamW, those weights, horizontal and vertical flips, and an optional crop or integer downsample. Each epoch appends val FG mIoU and per-class IoU to `metrics.jsonl` and `metrics.csv`, and keeps `best.pt`. `--patience N` turns on early stopping. `--smoke` runs two steps.
+- `python -m sw.train` (same flags as `python scripts/train.py`) trains with AdamW, those weights, horizontal and vertical flips, and an optional crop or integer downsample. Each epoch appends val FG mIoU and per-class IoU to `metrics.jsonl` and `metrics.csv`, keeps `best.pt`, and writes `last.pt` (model, optimizer, scheduler, epoch, best FG mIoU) for `--resume`. The default schedule is cosine annealing over `--epochs` (`--no-cosine` keeps a constant learning rate). `--amp` is mixed precision on CUDA. A trailing training batch of one image is dropped and logged. Colab steps: [`docs/COLAB.md`](docs/COLAB.md). `--patience N` turns on early stopping. `--smoke` runs two steps.
 - `MiniNetSeg` is a small encoder-decoder in the MiniNet family: a 1×1 band-reduction stem, depthwise separable convolutions, and a multi-dilation module. The default width is 571,879 parameters. `python -m sw.models.cnn` prints that count.
 
 ## Timeline after the checkup
@@ -92,7 +92,7 @@ Every pull request on `main` in this window was merged by Scott. Surya, Tim, Pra
 
 - Never commit data. `data/`, `spectralwaste_segmentation/`, and the tiff cubes are gitignored. The loader reads the folder from the `SW_ROOT` environment variable. Checkpoints and `runs/` stay untracked too.
 - One branch per work package, small pull requests, at least one review. Scott reviews until someone else picks up a review.
-- Train on Colab GPUs (SJSU account). The data is about 24 GB unzipped, so download it inside Colab rather than through Drive.
+- Train on Colab GPUs (SJSU account). The data is about 24 GB unzipped. Put the cubes on the Colab local disk and the checkpoints on Drive ([`docs/COLAB.md`](docs/COLAB.md)).
 - Use the official split only. Do not add other datasets to help the transformer.
 - On every slide, tie band tokens, attention, and the segmentation head back to lecture topics. Class guidance wins over the syllabus text.
 

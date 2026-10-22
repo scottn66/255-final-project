@@ -112,6 +112,35 @@ def test_smoke_flag_shortens_the_run():
     assert overridden.downsample == 1
     assert overridden.out_dir == "runs/custom"
     assert overridden.max_train_steps == 2
+    explicit = config_from_args(
+        _build_parser().parse_args(
+            [
+                "--max-train-images",
+                "3",
+                "--max-val-images",
+                "1",
+                "--max-train-steps",
+                "5",
+                "--no-cosine",
+                "--amp",
+                "--resume",
+                "runs/cnn/last.pt",
+            ]
+        )
+    )
+    assert explicit.max_train_images == 3
+    assert explicit.max_val_images == 1
+    assert explicit.max_train_steps == 5
+    assert explicit.cosine is False
+    assert explicit.amp is True
+    assert explicit.resume == "runs/cnn/last.pt"
+    # An explicit step limit wins over the smoke default of 2.
+    smoke_steps = config_from_args(
+        _build_parser().parse_args(["--smoke", "--max-train-steps", "7"])
+    )
+    assert smoke_steps.max_train_steps == 7
+    assert smoke_steps.max_train_images == 4
+    assert smoke_steps.cosine is True
 
 
 def test_harness_smoke_on_synthetic_cubes(tmp_path, capsys):
@@ -162,9 +191,128 @@ def test_harness_smoke_on_synthetic_cubes(tmp_path, capsys):
     checkpoint = torch.load(out / "best.pt", map_location="cpu", weights_only=False)
     assert checkpoint["class_weight_scheme"] == "paper"
     assert len(checkpoint["class_weights"]) == 7
+    last = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    for key in ("model", "optimizer", "scheduler", "epoch", "best_val_fg_miou"):
+        assert key in last
+    assert last["epoch"] == 1
+    assert last["scheduler"] is not None
     restored = MiniNetSeg()
     restored.load_state_dict(checkpoint["model"])
     restored.eval()
     with torch.no_grad():
         logits = restored(torch.zeros(1, 224, 16, 16))
     assert logits.shape == (1, 7, 16, 16)
+
+
+def _adam_step(checkpoint) -> int:
+    steps = []
+    for slot in checkpoint["optimizer"]["state"].values():
+        if "step" not in slot:
+            continue
+        value = slot["step"]
+        steps.append(int(value.item() if torch.is_tensor(value) else value))
+    assert steps
+    return max(steps)
+
+
+def test_resume_restores_optimizer_and_appends_the_log(tmp_path, capsys):
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    out = tmp_path / "run"
+    common = [
+        "--data-root",
+        str(root),
+        "--out-dir",
+        str(out),
+        "--device",
+        "cpu",
+        "--batch-size",
+        "2",
+        "--downsample",
+        "4",
+        "--num-workers",
+        "0",
+        "--max-train-images",
+        "4",
+        "--max-val-images",
+        "2",
+        "--max-train-steps",
+        "1",
+        "--seed",
+        "0",
+    ]
+    first = main([*common, "--epochs", "1"])
+    assert first["epochs_ran"] == 1
+    last = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    assert last["epoch"] == 1
+    assert last["scheduler"]["last_epoch"] == 1
+    assert last["best_val_fg_miou"] is not None
+    assert _adam_step(last) == 1
+    with (out / "metrics.jsonl").open(encoding="utf-8") as handle:
+        first_rows = [json.loads(line) for line in handle if line.strip()]
+    assert [row["epoch"] for row in first_rows] == [1]
+
+    capsys.readouterr()
+    second = main([*common, "--epochs", "2", "--resume", str(out / "last.pt")])
+    printed = capsys.readouterr().out
+    assert "resumed" in printed
+    assert "next epoch 2" in printed
+    assert second["epochs_ran"] == 2
+    last_again = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    assert last_again["epoch"] == 2
+    assert last_again["scheduler"]["last_epoch"] == 2
+    # A fresh optimizer would be back at step 1. Step 2 means the state was restored.
+    assert _adam_step(last_again) == 2
+    with (out / "metrics.jsonl").open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    assert [row["epoch"] for row in rows] == [1, 2]
+    assert rows[0]["train_loss"] == first_rows[0]["train_loss"]
+    with (out / "metrics.csv").open(encoding="utf-8") as handle:
+        table = list(csv.DictReader(handle))
+    assert [row["epoch"] for row in table] == ["1", "2"]
+
+
+def test_size_one_tail_is_logged_and_cpu_amp_is_skipped(tmp_path, capsys):
+    root = tmp_path / "data"
+    _write_split(root, "train", 5)
+    _write_split(root, "val", 2)
+    from sw.train import TrainConfig, train
+
+    class TinyHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(224, 7, kernel_size=1)
+
+        def forward(self, x):
+            return self.conv(x)
+
+    train(
+        TinyHead(),
+        TrainConfig(
+            data_root=str(root),
+            out_dir=str(tmp_path / "run"),
+            epochs=1,
+            batch_size=4,
+            num_workers=0,
+            device="cpu",
+            downsample=4,
+            cosine=False,
+            amp=True,
+        ),
+    )
+    printed = capsys.readouterr().out
+    assert "train loader drop_last: leaving out 1 image" in printed
+    assert "full precision" in printed
+    last = torch.load(tmp_path / "run" / "last.pt", map_location="cpu", weights_only=False)
+    assert last["scheduler"] is None
+    assert last["epoch"] == 1
+    with (tmp_path / "run" / "metrics.jsonl").open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    assert rows[0]["steps"] == 1
+
+
+def test_batch_size_one_is_rejected():
+    from sw.train import TrainConfig, train
+
+    with pytest.raises(ValueError, match="BatchNorm"):
+        train(torch.nn.Conv2d(1, 1, 1), TrainConfig(batch_size=1))

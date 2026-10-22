@@ -13,7 +13,7 @@ bash scripts/get_data.sh
 export SW_ROOT="$PWD/data/spectralwaste_segmentation"
 ```
 
-Train the CNN control with `PYTHONPATH=src python -m sw.train --smoke` (two CPU steps). A real run is `PYTHONPATH=src python -m sw.train --epochs 30 --batch-size 4 --out-dir runs/cnn` on a Colab GPU.
+Train the CNN control with `PYTHONPATH=src python -m sw.train --smoke` (two CPU steps). A real run is `PYTHONPATH=src python -m sw.train --epochs 30 --batch-size 4 --out-dir runs/cnn` on a Colab GPU. Disk layout and resume are in [`docs/COLAB.md`](docs/COLAB.md).
 
 On Colab, skip the virtualenv and run that download in the notebook. The unpacked set is about 24 GB, so download it there instead of through Drive. Then open `notebooks/01_look_at_the_data.ipynb` and `notebooks/02_pipeline_smoke_test.ipynb`.
 
