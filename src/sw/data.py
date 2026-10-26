@@ -72,15 +72,44 @@ SW_ROOT_HELP = (
 )
 
 
-def class_weights(counts=HYPER_LT_TRAIN_PIXEL_COUNTS) -> torch.Tensor:
-    """Inverse-frequency class weights with mean 1, for ``nn.CrossEntropyLoss``.
+def class_weights(counts=HYPER_LT_TRAIN_PIXEL_COUNTS, scheme="paper") -> torch.Tensor:
+    """Class weights for ``nn.CrossEntropyLoss`` (pass as ``weight=``).
 
-    Pass the returned tensor as ``weight=``. Rare classes (filament) get a
-    larger weight. ``counts`` defaults to the hyperspectral train counts above.
+    ``scheme="paper"`` (the default) is the SpectralWaste median-frequency
+    scheme:
+
+        w_c = (median(f) / f_c) ** 0.12
+        f = counts / counts.sum()
+
+    On ``HYPER_LT_TRAIN_PIXEL_COUNTS`` that is about
+    ``[0.676, 0.937, 1.000, 1.207, 1.125, 1.516, 0.900]``.
+    Basket is the median class, so its weight is 1. The rare class
+    (filament) is up-weighted, but only to about 1.5, not to 5.
+
+    ``scheme="inverse"`` is inverse frequency normalized so the weights
+    have mean 1. On the same counts the spread is about 830x
+    (background ~0.006, filament ~5.4). Training uses ``"paper"`` because
+    the 0.12 exponent keeps every weight near 1. With an even number of
+    classes, ``torch.median`` picks the upper of the two middle frequencies.
+    The seven SpectralWaste classes are an odd count, so the median is the
+    middle one.
+
+    The counts are the hyperspectral train counts, not the RGB counts in
+    ``meta.json``. The paper weighted hyperspectral runs with those RGB
+    counts. We use this formula on the hyperspectral counts instead.
     """
+    if scheme not in ("paper", "inverse"):
+        raise ValueError(f"scheme must be 'paper' or 'inverse', got {scheme!r}")
     freq = torch.tensor(list(counts), dtype=torch.float32)
-    weights = 1.0 / freq
-    return weights / weights.mean()
+    if torch.any(freq <= 0):
+        raise ValueError("class counts must be positive")
+    if scheme == "inverse":
+        weights = 1.0 / freq
+        return weights / weights.mean()
+    fraction = freq / freq.sum()
+    # Odd number of classes: median is the middle frequency, not an average
+    # of the two middle ones.
+    return (fraction.median() / fraction) ** 0.12
 
 
 def resolve_root(root=None) -> Path:
