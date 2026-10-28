@@ -22,6 +22,7 @@ Outputs are saved, so you can read them on GitHub before downloading the data. T
 ## Repo map
 
 - [`docs/PLAN.md`](docs/PLAN.md) — work packages, owners, timeline
+- [`docs/RECIPE.md`](docs/RECIPE.md) — cited recipe for the from-scratch band-token transformer
 - `scripts/get_data.sh` — download the Zenodo zip and check its md5
 - `notebooks/` — look at one cube, then a one-batch smoke test
 - `src/sw/` — dataset loader, FG-only mIoU, from-scratch attention / wavelength-encoding building blocks, the CNN control, and `python -m sw.train`
