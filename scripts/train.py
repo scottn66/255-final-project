@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the CNN control. Same flags as ``python -m sw.train``.
+"""Train a SpectralWaste model. Same flags as ``python -m sw.train``.
 
 Adds ``src/`` to the import path so this works from a fresh clone, before
 ``pip install -e .``.
