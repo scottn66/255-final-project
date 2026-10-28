@@ -1,6 +1,6 @@
 # DATA 255 Group 1 — SpectralWaste team plan
 
-Rev 3. Updated Thu Oct 22, 2026. Group: Scott Nelson, Surya Reddy, Tim Wada, Prakhar, Yash.
+Rev 4. Updated Wed Oct 28, 2026. Group: Scott Nelson, Surya Reddy, Tim Wada, Prakhar, Yash.
 
 Scott Nelson owns the critical path and reviews the pull requests. Teammates have not answered the Oct 6 email. The optional tasks below do not block anything. This revision is scaffolding for the Nov 4 checkup, not a finished graded hand-in.
 
@@ -9,7 +9,7 @@ Scott Nelson owns the critical path and reviews the pull requests. Teammates hav
 - We segment jam objects on a recycling line with a small spectral–spatial transformer we build from scratch (no pretrained weights). Topic approved by Jeong; confirmed verbally with Mamta.
 - Data: Zenodo record 10880544, `spectralwaste_segmentation.zip` ([Casao et al., IROS 2024](https://arxiv.org/abs/2403.18033)), 23 GB, md5 `ae2c268bb385345f12e55b4389d2d3b9`. Checked on the real files: 514 train / 167 val / 171 test. Cubes are 224 bands from 900 to 1700 nm, stored 224 × 256 × 256. Masks use classes 0–6 (0 = background, 6 object classes).
 - Metric: mIoU over the 6 object classes. Our bar is the published hyperspectral-only results, MiniNet-v2 at 52.8 and SegFormer-B0 at 54.3. CMX-B0's 58.2 uses RGB and hyperspectral together, so we cite it as context, not as a target.
-- In the repo now: the loader, foreground mIoU, from-scratch attention (`src/sw/attention.py`), wavelength encoding (`src/sw/pe.py`), the paper class-weight default, a training harness (`python -m sw.train`), and a MiniNet-family CNN control (`MiniNetSeg`, 571,879 parameters). No real validation score yet. No band-token transformer yet.
+- In the repo now: the loader, foreground mIoU, from-scratch attention (`src/sw/attention.py`), wavelength encoding (`src/sw/pe.py`), the paper class-weight default, a training harness (`python -m sw.train`), and a MiniNet-family CNN control (`MiniNetSeg`, 571,879 parameters). The first CNN run (`MiniNetSeg`, half resolution via `--downsample 2`, 30 epochs, A100) reached best val FG mIoU 0.391 at epoch 29 (0.384 at epoch 30). The band tokenizer merged (PR #9, Tim Wada). The band-token transformer is not yet assembled.
 
 ## Critical path (Scott)
 
@@ -17,10 +17,15 @@ Scott directs and reviews. He will do these whether or not the optional tasks co
 
 | When | What | Done when |
 |---|---|---|
-| This week (from Oct 22) | Training harness + CNN baseline | `python -m sw.train --smoke` finishes on CPU. `MiniNetSeg` maps 224 bands to 7 full-resolution classes and has about 0.4–0.8M parameters. |
-| ~Oct 26 | First real CNN validation score | One Colab run of `MiniNetSeg` on the official train split, FG mIoU on the official val split, logged in `metrics.csv`. Any number is a result. 52.8 is context, not a gate. |
+| Done (Oct 22, PR #7) | Training harness + CNN baseline | `python -m sw.train --smoke` finishes on CPU. `MiniNetSeg` maps 224 bands to 7 full-resolution classes and has about 0.4–0.8M parameters. |
+| Done Oct 27: 0.391 FG mIoU | First real CNN validation score | first CNN run, half resolution. One Colab run of `MiniNetSeg` on the official train split, FG mIoU on the official val split, logged in `metrics.csv`. Any number is a result. 52.8 is context, not a gate. |
+| ~Oct 30 | Eval add-on on CNN best.pt | per-class IoU incl. background, confusion matrix, per-class precision/recall, per-image mIoU, filament image counts in val/test |
 | ~Nov 1 | Minimal band-token transformer | A small model that uses our band tokenizer and `src/sw/attention.py`, trained briefly on Colab on the real cubes. |
 | **Wed Nov 4, 6 PM** | Progress checkup, 5 of 20 points (Canvas 7916136) | Three things on the slides: the CNN score, evidence the transformer trained on real data, and the Phase 2/3 plan. A score below 52.8, or below the CNN, is a normal from-scratch result on 514 images. |
+
+## Known issue
+
+Filament IoU is 0.000 in every epoch (rarest class). Counts of filament images in val/test pending the eval add-on.
 
 ## Optional tasks (1–2 hours, blocks nothing)
 
@@ -43,16 +48,16 @@ Each person has one task. If it does not happen, the critical path still moves.
 
 The old suggested-owner column is retired. Scott holds every package on the critical path. The four optional tasks are the only teammate asks.
 
-| # | Work package | Done when | Status on Oct 22 |
-|---|---|---|---|
-| WP1 | Data loader + repo cleanup | `SpectralWasteDataset` returns a (224, 256, 256) float in [0, 1] and a (256, 256) mask; asserts 514/167/171 | Done (Scott, Oct 6) |
-| WP2 | Colab data setup | One notebook cell downloads the zip, checks md5, and unzips | Scaffold is in the notebooks. Yash's optional task is to run notebook 01 and post a screenshot. |
-| WP3 | Training + evaluation harness | Loss with class weights, val early stopping, foreground mIoU plus per-class IoU, checkpoint and a results CSV | Scaffold landed Oct 22 (`src/sw/train.py`). A real Colab score is the Oct 26 row. |
-| WP4 | CNN control model | Small CNN (~0.4–0.8M params) trains through WP3 | `MiniNetSeg` is in `src/sw/models/cnn.py`. First val score is still open. |
-| WP5 | Band tokenizer + positional encoding | Groups the 224 bands into tokens; shape checks pass | Positional encoding is in `src/sw/pe.py`. The tokenizer is part of the Nov 1 model. |
-| WP6 | Transformer blocks + seg head | Our own QKV attention and a decoder that outputs (7, 256, 256) logits | Attention blocks are in `src/sw/attention.py`. The seg head is part of the Nov 1 model. |
-| WP7 | Experiments + results table | Runs the transformer through the harness and fills the table vs 52.8 / 54.3 (58.2 as context) | After the checkup. |
-| WP8 | Checkup deck + writeup | Nov 4 slides: problem, data, model diagram, mean IoU table, failure notes, Phase 2/3 plan | Not started. Surya's optional task is the data slide only. |
+| # | Work package | Done when | Status on Oct 22 | Status on Oct 28 |
+|---|---|---|---|---|
+| WP1 | Data loader + repo cleanup | `SpectralWasteDataset` returns a (224, 256, 256) float in [0, 1] and a (256, 256) mask; asserts 514/167/171 | Done (Scott, Oct 6) | Done (Scott, Oct 6) |
+| WP2 | Colab data setup | One notebook cell downloads the zip, checks md5, and unzips | Scaffold is in the notebooks. Yash's optional task is to run notebook 01 and post a screenshot. | Scaffold is in the notebooks. Yash's optional task is to run notebook 01 and post a screenshot. |
+| WP3 | Training + evaluation harness | Loss with class weights, val early stopping, foreground mIoU plus per-class IoU, checkpoint and a results CSV | Scaffold landed Oct 22 (`src/sw/train.py`). A real Colab score is the Oct 26 row. | Done |
+| WP4 | CNN control model | Small CNN (~0.4–0.8M params) trains through WP3 | `MiniNetSeg` is in `src/sw/models/cnn.py`. First val score is still open. | first score 0.391 (half res) |
+| WP5 | Band tokenizer + positional encoding | Groups the 224 bands into tokens; shape checks pass | Positional encoding is in `src/sw/pe.py`. The tokenizer is part of the Nov 1 model. | tokenizer Done (Tim, PR #9; 14 groups x 16 bands, Conv2d 16->64 k8 s8, output (B,1024,14,64), 66,624 params) |
+| WP6 | Transformer blocks + seg head | Our own QKV attention and a decoder that outputs (7, 256, 256) logits | Attention blocks are in `src/sw/attention.py`. The seg head is part of the Nov 1 model. | attention exists, spectral blocks / spatial blocks / seg head open |
+| WP7 | Experiments + results table | Runs the transformer through the harness and fills the table vs 52.8 / 54.3 (58.2 as context) | After the checkup. | not started |
+| WP8 | Checkup deck + writeup | Nov 4 slides: problem, data, model diagram, mean IoU table, failure notes, Phase 2/3 plan | Not started. Surya's optional task is the data slide only. | not started |
 
 ## Built-in layers, the model we report, and the Nov 4 slides
 
@@ -62,9 +67,9 @@ The model we report as ours must use our own band tokenizer (WP5) and the attent
 
 Lecture tie-ins are a helpful framing for the slides. Band tokens and the wavelength encoding relate to the ViT-components slide in Lecture 1 (patch embedding, position embedding, class token). Segmentation and mIoU relate to Lecture 9 (Oct 21). What was actually said in class, and Jeong's direct guidance, take precedence over the syllabus text.
 
-## Contributions log (Oct 6–22)
+## Contributions log (Oct 6–28)
 
-Every pull request on `main` in this window was merged by Scott. Surya, Tim, Prakhar, and Yash have no commits here.
+Every pull request on `main` in this window was merged by Scott. Tim Wada landed the band tokenizer (PR #9). Surya, Prakhar, and Yash have no commits here.
 
 | Date | What landed | Who |
 |---|---|---|
@@ -74,6 +79,9 @@ Every pull request on `main` in this window was merged by Scott. Surya, Tim, Pra
 | Oct 7 | Executed notebooks committed so the Oct 6 real-data run is visible on GitHub (PR #6) | Scott Nelson |
 | Oct 19 | Plan note: lecture framing, and the syllabus text is not the slide gate (PR #5) | Scott Nelson |
 | Oct 22 | Paper class weights, training harness, MiniNet-family CNN baseline (this revision) | Scott Nelson |
+| Oct 26 | docs/RECIPE.md cited band-token recipe (PR #8) | Scott Nelson |
+| Oct 27 | BandTokenizer + tests (PR #9) | Tim Wada |
+| Oct 27 | Colab CNN training notebook 03_train_cnn.ipynb; first real CNN run | Scott Nelson |
 
 ## What rev 3 adds in the code
 
