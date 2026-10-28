@@ -1,4 +1,10 @@
-"""Training harness for the SpectralWaste CNN control.
+"""Training harness for SpectralWaste.
+
+``--model cnn`` (the default) is ``MiniNetSeg``. ``--model transformer``
+is the band-token scaffold in ``sw.models.transformer``. That forward
+raises ``NotImplementedError`` until the TODOs in
+``docs/TRANSFORMER-TODO.md`` are filled in. Leaving ``--model`` unset
+keeps the CNN path.
 
 ``train(model, cfg)`` runs AdamW and weighted cross-entropy, reports
 foreground mIoU on the validation split after every epoch, and writes
@@ -9,6 +15,7 @@ scheduler, epoch, best foreground mIoU). ``best.pt`` is the best weights.
 Run it from the repo root:
 
     PYTHONPATH=src python -m sw.train --smoke
+    PYTHONPATH=src python -m sw.train --model transformer --smoke
     PYTHONPATH=src python -m sw.train --epochs 30 --batch-size 4 --out-dir runs/cnn
 
 ``--smoke`` is two optimizer steps on a few images. It is a CPU-friendly
@@ -38,6 +45,7 @@ from torch.utils.data import DataLoader, Dataset
 from sw.data import CLASS_NAMES, SpectralWasteDataset, class_weights
 from sw.metrics import ConfusionMeter
 from sw.models.cnn import MiniNetSeg, count_parameters
+from sw.models.transformer import BandTransformer
 
 
 @dataclass
@@ -66,6 +74,10 @@ class TrainConfig:
     ``epochs``. ``amp`` turns on CUDA mixed precision. On cpu or mps it is
     ignored and a line is printed. ``resume`` is a ``last.pt`` path; training
     continues at the next epoch and the metrics files are appended.
+
+    ``model`` is ``"cnn"`` (``MiniNetSeg``) or ``"transformer"``
+    (``BandTransformer``). The depth, width, head, MLP, patch, and group
+    fields size the transformer. A CNN run stores them and leaves them unused.
     """
 
     data_root: str | None = None
@@ -87,6 +99,14 @@ class TrainConfig:
     cosine: bool = True
     amp: bool = False
     resume: str | None = None
+    model: str = "cnn"
+    depth_spectral: int = 2
+    depth_spatial: int = 6
+    dim: int = 64
+    heads: int = 4
+    mlp_ratio: float = 4.0
+    patch: int = 8
+    group: int = 16
 
 
 def resolve_device(name: str) -> torch.device:
@@ -262,6 +282,22 @@ def _check_cfg(cfg: TrainConfig) -> None:
             raise ValueError(f"{name} must be >= 1, got {value}")
     if cfg.resume is not None and not Path(cfg.resume).is_file():
         raise FileNotFoundError(f"resume checkpoint does not exist: {cfg.resume}")
+    if cfg.model not in ("cnn", "transformer"):
+        raise ValueError(f"model must be 'cnn' or 'transformer', got {cfg.model!r}")
+    if cfg.model == "transformer":
+        if cfg.depth_spectral < 0 or cfg.depth_spatial < 0:
+            raise ValueError(
+                f"depths must be >= 0, got spectral {cfg.depth_spectral}, "
+                f"spatial {cfg.depth_spatial}"
+            )
+        if cfg.dim < 1 or cfg.heads < 1 or cfg.dim % cfg.heads != 0:
+            raise ValueError(f"dim={cfg.dim} must be divisible by heads={cfg.heads}")
+        if cfg.mlp_ratio <= 0:
+            raise ValueError(f"mlp_ratio must be > 0, got {cfg.mlp_ratio}")
+        if cfg.patch < 1:
+            raise ValueError(f"patch must be >= 1, got {cfg.patch}")
+        if cfg.group < 1:
+            raise ValueError(f"group must be >= 1, got {cfg.group}")
 
 
 def _log_mode(path: Path, resume: bool) -> str:
@@ -544,7 +580,53 @@ def _result(best, best_epoch, epochs_ran, n_params, out_dir, jsonl_path) -> dict
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train the SpectralWaste CNN control (MiniNetSeg)."
+        description="Train a SpectralWaste model. The default is the CNN control (MiniNetSeg)."
+    )
+    parser.add_argument(
+        "--model",
+        choices=["cnn", "transformer"],
+        default="cnn",
+        help="cnn is MiniNetSeg. transformer is the band-token scaffold.",
+    )
+    parser.add_argument(
+        "--depth-spectral",
+        type=int,
+        default=2,
+        help="Spectral blocks (transformer). Default 2.",
+    )
+    parser.add_argument(
+        "--depth-spatial",
+        type=int,
+        default=6,
+        help="Spatial blocks (transformer). Default 6.",
+    )
+    parser.add_argument("--dim", type=int, default=64, help="Token width D (transformer). Default 64.")
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=4,
+        help="Attention heads (transformer). dim must be divisible by heads. Default 4.",
+    )
+    parser.add_argument(
+        "--mlp-ratio",
+        type=float,
+        default=4.0,
+        help="MLP hidden width is dim * mlp_ratio (transformer). Default 4.",
+    )
+    parser.add_argument(
+        "--patch",
+        type=int,
+        default=8,
+        help=(
+            "Tokenizer patch and stride (transformer). "
+            "At --downsample 2 a 256 cube is 128, so patch 8 is a 16x16 grid (256 tokens)."
+        ),
+    )
+    parser.add_argument(
+        "--group",
+        type=int,
+        default=16,
+        help="Bands per tokenizer group (transformer). 224 / 16 = 14 groups.",
     )
     parser.add_argument("--data-root", default=None, help="Dataset folder. Default: the SW_ROOT environment variable.")
     parser.add_argument("--epochs", type=int, default=30)
@@ -561,7 +643,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
-    parser.add_argument("--out-dir", default=None, help="Default: runs/cnn, or runs/smoke with --smoke.")
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="Default: runs/cnn, runs/transformer with --model transformer, or runs/smoke with --smoke.",
+    )
     parser.add_argument(
         "--weight-scheme",
         default="paper",
@@ -635,6 +721,8 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         out_dir = args.out_dir
     elif smoke:
         out_dir = "runs/smoke"
+    elif args.model == "transformer":
+        out_dir = "runs/transformer"
     else:
         out_dir = "runs/cnn"
     return TrainConfig(
@@ -657,7 +745,39 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         cosine=not args.no_cosine,
         amp=bool(args.amp),
         resume=args.resume,
+        model=args.model,
+        depth_spectral=args.depth_spectral,
+        depth_spatial=args.depth_spatial,
+        dim=args.dim,
+        heads=args.heads,
+        mlp_ratio=args.mlp_ratio,
+        patch=args.patch,
+        group=args.group,
     )
+
+
+def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
+    """``cnn`` builds ``MiniNetSeg``. ``transformer`` builds ``BandTransformer``.
+
+    The transformer size fields live on ``cfg``. ``in_channels`` is the CLI
+    ``--in-channels`` value (real cubes are 224) and is the tokenizer's
+    band count. CNN runs ignore the transformer size fields.
+    """
+    if cfg.model == "cnn":
+        return MiniNetSeg(in_channels=in_channels)
+    if cfg.model == "transformer":
+        return BandTransformer(
+            depth_spectral=cfg.depth_spectral,
+            depth_spatial=cfg.depth_spatial,
+            dim=cfg.dim,
+            heads=cfg.heads,
+            mlp_ratio=cfg.mlp_ratio,
+            num_classes=7,
+            n_bands=in_channels,
+            group=cfg.group,
+            patch=cfg.patch,
+        )
+    raise ValueError(f"model must be 'cnn' or 'transformer', got {cfg.model!r}")
 
 
 def main(argv: list[str] | None = None) -> dict:
@@ -666,7 +786,7 @@ def main(argv: list[str] | None = None) -> dict:
     # Seed before the constructor so a re-run with the same seed starts
     # from the same weights. train() seeds again for the data pipeline.
     set_seed(cfg.seed)
-    model = MiniNetSeg(in_channels=args.in_channels)
+    model = build_model(cfg, in_channels=args.in_channels)
     return train(model, cfg)
 
 
