@@ -117,7 +117,7 @@ def test_default_model_is_cnn_and_transformer_flags_build():
     assert smoke.out_dir == "runs/smoke"
 
 
-@todo
+
 def test_spectral_block_shape():
     block = SpectralBlock(dim=64, heads=4, mlp_ratio=4)
     tokens = torch.randn(2, 16, 14, 64)  # (B, N, G, D)
@@ -126,7 +126,7 @@ def test_spectral_block_shape():
     assert torch.isfinite(out).all()
 
 
-@todo
+
 def test_spectral_pool_shape():
     pool = SpectralPool(dim=64)
     tokens = torch.randn(2, 16, 14, 64)  # (B, N, G, D)
