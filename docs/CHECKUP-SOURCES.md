@@ -37,6 +37,9 @@ Our own numbers come from the repo, `main` at 7ea4556: `docs/RESULTS.md` (the ru
 | 6 | background about 82% of train pixels | 27,612,233 / 33,685,504 = 81.97% | of train pixels |
 | 6 | filament 33,101 pixels, 0.098% | `src/sw/data.py` | of train pixels |
 | 6 | FG mIoU = mean IoU of classes 1 to 6 | `src/sw/metrics.py`; L1 Sec V-A "their mean"; each Table IV row averages to its printed mIoU | same as Table IV; IoU = TP / (TP + FP + FN) over all val pixels |
+| 6 or 3 | data example: cube `20221028_02_092121`, film, tape, filament (657 px), bag | notebook 04 cell C on the Zenodo train split; `docs/figures/data_example.png` | one cube; the false colour is three infrared bands, display-stretched |
+| 3 or 6 | class spectra from the 8 richest cubes per class (47 cubes); cardboard 60% and filament 42% of their train pixels are in those cubes | notebook 04 cell D; `docs/figures/band_signatures.png` | mean of cube means; nominal nm assumes even spacing |
+| 7 | gap per class, paper minus ours: filament 30.5, cardboard 21.0, bag 12.7, basket 11.5, film 6.0, tape 0.2; those two are 63% | L1 Table IV minus `docs/RESULTS.md`; notebook 04 cell A | points |
 | 7 Baseline | MiniNetSeg 571,879 params | `python -m sw.models.cnn` | |
 | 7 | 39.1, best val FG mIoU, epoch 29 | `docs/RESULTS.md`, row `cnn_ds2` | val; half resolution for cube and mask; 30 epochs; batch 4; one run |
 | 7 | per class 55 / 50 / 58 / 29 / 44 / 0 | same row: .552 .495 .578 .286 .436 .000 | background .868 is not in the mean |

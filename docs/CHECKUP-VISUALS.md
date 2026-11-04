@@ -30,30 +30,24 @@ Constraints: the data is 23 GB and on no machine right now, so anything that rea
 
 | # | Artifact | Deck slot | Needs data | Time | Cut line |
 |---|---|---|---|---|---|
-| A | Per-class IoU bar chart (TODO 7) | slide 7 | No | 30 min | Keep |
-| B | Architecture strip, current vs goal (TODO 2) | slide 8 | No | 90 min | Keep; simplify to the transformer row if short |
+| A | Per-class IoU, grouped bars with the gap (TODO 7) | slide 7 | No | done, 8397ff3 | Keep |
+| B | Architecture strip, current vs goal (TODO 2) | slide 8 | No | done, 8397ff3 | Keep |
 | E | Q&A facts sheet | `docs/CHECKUP-QA.md`, written | No | answers only | Keep |
 | F | Source card | `docs/CHECKUP-SOURCES.md`, written; copy to the backup slide | No | 10 min | Keep |
-| C | Data example, three panels (TODO 3) | slide 6, or slide 3 for the RGB claim | Yes | 30 min after download | Fall back to the Oct 6 notebook outputs |
-| D | Spectral signature chart, 6 classes over 224 bands | slide 3 or 6, not both with C's panel 3 | Yes | 45 min after download | First to drop |
+| C | Data example, three panels (TODO 3) | slide 6, or slide 3 for the RGB claim | Yes | done, 8397ff3 | Keep |
+| D | Mean spectrum per class, 8 richest cubes each | slide 3 or 6, not both with C's panel 3 | Yes | done, 8397ff3 | Keep |
 | G | Transformer run evidence | Nov 5 | Yes, plus the three stubs | | Deferred |
 
-## A. Per-class IoU bar chart (slide 7)
+## A. Per-class IoU (slide 7)
 
-Spec, as agreed in the review's figure B:
+Drawn by notebook 04, cell A, committed as `docs/figures/per_class_iou.png` (8397ff3):
 
-- Data: `docs/RESULTS.md` row `cnn_ds2`, epoch 29, in percent: film 55.2, basket 49.5, cardboard 57.8, tape 28.6, filament 0.0, bag 43.6.
-- Horizontal bars, one per object class, sorted high to low so filament sits last. Percent axis 0 to 100 to match the 39.1 on the card.
-- One reference tick per class for MiniNet-v2 HYPER from Table IV: film 61.2, basket 61.0, cardboard 78.8, tape 28.8, filament 30.5, bag 56.3, labelled "paper, full res, 200 epochs". MiniNet-v2 is the fair reference because MiniNetSeg is from the same family.
-- A vertical line at 39.1 labelled "FG mIoU, mean of the six bars". Optional second line at 52.8, "paper mean".
-- Print "0.0" on the filament bar so it reads as a result, not as missing data.
-- Background (86.8) stays off; it is not in the mean.
-- Condition line under the chart: MiniNetSeg, 571,879 params, half resolution (cube and mask), 30 epochs, val, best epoch 29, one run.
-- Bar colours: the dataset palette (below), so the chart agrees with the mask on slide 6.
-
-What it shows, for the notes: tape already matches the paper (28.6 vs 28.8); the largest gaps are filament (30.5 points) and cardboard (21.0). Filament and cardboard are 63% of the 13.7-point gap. If filament matched the paper's 30.5, the mean would be 44.2.
-
-Save as `docs/figures/per_class_iou.png`, dpi 200, about 10 by 4.5 inches, with the cell or script that made it.
+- Grouped horizontal bars per object class. The upper bar is ours in the class colour, the lower bar is the paper's MiniNet-v2 HYPER row in light grey, both with the value printed. MiniNet-v2 is the fair reference because MiniNetSeg is from the same family.
+- Classes are sorted by the gap, paper minus ours, and that gap is printed on the right edge in points: filament 30.5, cardboard 21.0, bag 12.7, basket 11.5, film 6.0, tape 0.2.
+- The zero filament bar gets a small green marker at the axis and a bold "0.0", so it reads as a result.
+- The title's second line states the claim: FG mIoU 39.1 vs paper 52.8, filament and cardboard are 63% of the gap.
+- Footer: the condition line (MiniNetSeg, 571,879 params; half resolution for cube and mask; 30 epochs; val; best epoch 29; one run; background 86.8 not in the mean) and the source (Table IV; SegFormer-B0 HYPER 54.3 named as context, not drawn).
+- Percent axis 0 to 100, matching the 39.1 on the card.
 
 ## B. Architecture strip, current vs goal (slide 8)
 
@@ -80,6 +74,8 @@ The CNN control can be a second, thinner row if there is room: 1x1 band mix 224 
 
 Build in Slides with shapes so it stays editable during the dry run. An SVG in `docs/figures/architecture.svg` is the fallback; it needs no data and no torch.
 
+Drawn by notebook 04, cell B, committed as `docs/figures/architecture.png` and `.svg` (8397ff3), with the spectral block and pool solid (merged, PR #12), the three stubs dashed, and the subtitle "Merged through the spectral pool. The three dashed stages are still stubs, so there is no transformer score."
+
 ## C. Data example, three panels (slide 6, or slide 3 for the RGB claim)
 
 Notebook 01 already draws all three pieces for `train[0]`, which has only film, bag, and background. For the slide, pick a cube with filament and overlapping objects, so the panel shows why the label is per pixel. Scanning the mask PNGs costs nothing (no cube reads): loop over `labels_hyper_lt/train`, count classes per mask, and keep the stem. Print the stem on the slide.
@@ -92,13 +88,13 @@ Notebook 01 already draws all three pieces for `train[0]`, which has only film, 
 - 900 to 1700 nm is all infrared, so the cube cannot show what an RGB camera sees. A true RGB comparison needs the dataset's RGB images, which the loader does not read. Do not present the false-colour panel as "what RGB sees".
 - Caption: "One train cube, 224 by 256 by 256, uint16 scaled to [0, 1]. Masks are label-transfer masks (`labels_hyper_lt`), 79.6 mIoU against manual labels in the paper's Table II."
 
-Build: one cell at the end of notebook 01 that composes `plt.subplots(1, 3)` with equal heights from the variables already in scope and saves `docs/figures/data_example.png` at dpi 200. Commit the PNG, never the cube. Owner: Yash (his optional task is running notebook 01) or Surya (data slide), Scott otherwise.
+Drawn by notebook 04, cell C, committed as `docs/figures/data_example.png` (8397ff3). The chosen cube is `20221028_02_092121` with film, tape, filament (657 px, the thin green curve), and bag. The spectrum panel carries a legend with each class's pixel count in that cube and uses the loader's scaled values, not the display stretch. Film and background run close together in this cube; say so if asked, since that is where a model confuses classes.
 
-## D. Spectral signature chart, 224 bands and 6 materials
+## D. Mean spectrum per class, 8 richest cubes each (slide 3 or 6)
 
-Only if C's third panel is "one image" and there is time. Mean spectrum per object class over N train cubes with a faint plus or minus 1 sd band, background as a thin grey line, x axis band index with a second axis in nominal nm (900 + i x 800 / 223, labelled "nominal, even spacing assumed"), the 14 token groups shaded alternately, the three false-colour bands marked. Inset: class pixel share on a log axis (background 82.0%, filament 0.098%).
+Drawn by notebook 04, cell D, committed as `docs/figures/band_signatures.png` (8397ff3). For each object class the cell takes the 8 train cubes with the most pixels of that class (every mask scanned, only those 47 cubes read) and plots the mean of the 8 per-cube mean spectra. Only cardboard carries a plus or minus 1 sd band, because shading every class hid the lines. Background is the background pixels of those same cubes. The 14 token groups are striped, the three false-colour bands dotted, and the top axis is nominal nm with the even-spacing caveat written out. The right panel is the class share of all train pixels, a different population, and its title says so.
 
-Build: a Colab loop over `SpectralWasteDataset(split="train")` accumulating per-class sum, sum of squares, and count as (7, 224) arrays. N = 50 sorted stems is about 1.5 GB of reads and a couple of minutes; all 514 is about 15 GB and roughly ten minutes from local disk. Say N on the figure.
+Two cautions for the slide. The title's "overlap" is a reading: film, bag, and filament run about 0.05 to 0.08 above the background curve with the same shape, so "run close to the background" is the safer wording if challenged. The legend percentages (cardboard 60%, filament 42%) are the share of each class's train pixels that sit inside its 8 cubes, not accuracy numbers.
 
 ## E and F. Q&A facts sheet and source card
 
