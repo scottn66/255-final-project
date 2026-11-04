@@ -30,12 +30,12 @@ Constraints: the data is 23 GB and on no machine right now, so anything that rea
 
 | # | Artifact | Deck slot | Needs data | Time | Cut line |
 |---|---|---|---|---|---|
-| A | Per-class IoU, grouped bars, gap, 39.1 and 52.8 lines (TODO 7) | slide 7 | No | done | Keep |
-| B | Architecture strip with lecture tie-ins and ablation brackets (TODO 2) | slide 8 | No | done | Keep |
+| A | Per-class IoU, grouped bars, gap column, 39.1 and 52.8 lines (TODO 7) | slide 7, the box beside the card | No | done, in the deck | Keep |
+| B | Architecture strip with lecture tie-ins and ablation brackets (TODO 2) | its own slide after slide 8 | No | done, in the deck | Keep |
 | E | Q&A facts sheet | `docs/CHECKUP-QA.md`, written | No | answers only | Keep |
 | F | Source card | `docs/CHECKUP-SOURCES.md`, written; copy to the backup slide | No | 10 min | Keep |
-| C | Data example: RGB frame if shipped, false colour with outlines, mask, spectrum (TODO 3) | slide 6, or slide 3 for the RGB claim | Yes | cell redrawn; one Colab rerun | Keep |
-| D | Spectral shape per material, six small multiples, plus a raw version | slide 3 or 6, not both with C's panel 3 | Yes | cell redrawn; one Colab rerun | Keep |
+| C | Data example: RGB frame, false colour with outlines, mask, spectrum (TODO 3) | its own slide after slide 6 | Yes | done, in the deck | Keep |
+| D | Spectral shape per material, six small multiples, plus a raw version | its own slide after slide 3 | Yes | done, in the deck | Keep |
 | G | Transformer run evidence | Nov 5 | Yes, plus the three stubs | | Deferred |
 
 ## A. Per-class IoU (slide 7)
@@ -77,28 +77,18 @@ Build in Slides with shapes so it stays editable during the dry run. An SVG in `
 
 Drawn by notebook 04, cell B, committed as `docs/figures/architecture.png` and `.svg`: the spectral block and pool solid (merged, PR #12), the three stubs dashed, a lecture tie-in under each box title (L1 patch and position embedding, L1 QKV from `nn.Linear` plus softmax, L9 segmentation head, L9 mIoU), brackets over the stages each Phase 2 ablation row removes, and a subtitle that says from scratch, no pretrained weights, about 0.49M designed, and states the hypothesis. The footer keeps the half-resolution grid, the next steps, and Phase 3 INT8 as planned. The canvas is 13.33 by 7.5 inches with the axes filling it, so box text is sized against the real slide width.
 
-## C. Data example, three panels (slide 6, or slide 3 for the RGB claim)
+## C. Data example, four panels (its own slide after slide 6)
 
-Notebook 01 already draws all three pieces for `train[0]`, which has only film, bag, and background. For the slide, pick a cube with filament and overlapping objects, so the panel shows why the label is per pixel. Scanning the mask PNGs costs nothing (no cube reads): loop over `labels_hyper_lt/train`, count classes per mask, and keep the stem. Print the stem on the slide.
+Drawn by notebook 04, cell C, committed as `docs/figures/data_example.png` at 9.28 by 3.90 inches: cube `20221028_02_092121` with film, tape, filament (657 px) and bag. Four panels: the release's RGB frame (the Hugging Face mirror ships `<stem>.rgb.png`; the cell uses it when an `rgb/train` folder sits next to `hyper/`, and skips the panel otherwise), the false colour with the label outlines so the transferred masks can be judged against the scene, the mask with a one-row class legend under the images, and the mean spectrum per class with the closest pair named in the title (background and film, gap 0.009), which is where a model confuses classes. The footer carries the band numbers and the Table II label-transfer figure. Type is 8 to 9.5 pt at 1:1.
 
-1. False colour from bands 56, 112, 168 with the notebook's 2 to 98 percentile stretch. `meta.json` has no wavelengths; with even spacing over 900 to 1700 nm these sit near 1,100, 1,300, and 1,500 nm. Say "approx." or use band numbers.
-2. Label mask in the dataset palette, with a legend for all seven classes in the same colours as panel 3.
-3. Mean spectrum per class. The notebook averages one image; for the slide, either average each class over all train images or label it "one image". X axis band index or approximate nm, y axis scaled value 0 to 1.
+## D. Spectral shape per material (its own slide after slide 3)
 
-- If two class curves overlap in panel 3, say so; that pair is likely where the model confuses classes.
-- 900 to 1700 nm is all infrared, so the cube cannot show what an RGB camera sees. A true RGB comparison needs the dataset's RGB images, which the loader does not read. Do not present the false-colour panel as "what RGB sees".
-- Caption: "One train cube, 224 by 256 by 256, uint16 scaled to [0, 1]. Masks are label-transfer masks (`labels_hyper_lt`), 79.6 mIoU against manual labels in the paper's Table II."
+Drawn by notebook 04, cell D, committed at 9.28 by 3.90 inches as two files:
 
-Drawn by notebook 04, cell C. The committed `docs/figures/data_example.png` is the earlier version (cube `20221028_02_092121` with film, tape, filament at 657 px, and bag). The cell now adds the release's RGB frame as a first panel when an `rgb/train` folder exists next to `hyper/` (the only honest way to show what a colour camera sees), draws the label outlines over the false colour so the transferred masks can be judged against the scene, and names the closest pair of class means in the cube, which is where a model confuses classes. One Colab run of the cell refreshes the file.
+- `band_signatures.png`: six small multiples, one object class per panel, with each pixel's spectrum divided by its own mean before averaging. Brightness from illumination and thickness drops out, so only the shape stays. The highlighted class carries a plus or minus 1 sd band across its 8 cubes; the other classes are grey; background is dotted. Identity comes from the panel, not from colour alone. The x axis is nominal nm with the even-spacing caveat.
+- `band_signatures_raw.png`: the same grid on raw scaled values, for the backup. There film, bag and filament run about 0.05 to 0.08 above the background with the same shape, so "run close to the background" is the honest wording for the raw view.
 
-## D. Spectral shape per material (slide 3 or 6)
-
-Drawn by notebook 04, cell D. The committed `docs/figures/band_signatures.png` is the earlier single-panel version (8 richest cubes per class, raw brightness, cardboard shaded). The cell now makes two files, and one Colab run refreshes them:
-
-- `band_signatures.png`: six small multiples, one object class per panel, with each pixel's spectrum divided by its own mean before averaging. Brightness from illumination and thickness drops out, so only the shape stays, which is the evidence slide 3 needs that look-alike materials separate by spectrum. The highlighted class carries a plus or minus 1 sd band across its 8 cubes; the other classes are grey; background is dotted. Identity comes from the panel, not from colour alone. The x axis is nominal nm with the even-spacing caveat.
-- `band_signatures_raw.png`: the same grid on raw scaled values, for the backup.
-
-The class pixel share panel is gone; slide 6 states those numbers. The caption percentages (cardboard 60%, filament 42%) are the share of each class's train pixels that sit inside its 8 cubes, not accuracy numbers.
+What the normalized panels show: film has a sharp dip near 1180 nm and a second near 1380; filament and bag share deep dips near 1200 and 1390 with different slopes; cardboard rises to 1300 and falls hard past 1600; tape is nearly flat. That is the evidence slide 3 needs that look-alike materials separate by spectral shape, which raw brightness hides. The caption percentages (cardboard 60%, filament 42%) are the share of each class's train pixels that sit inside its 8 cubes, not accuracy numbers. The class pixel share panel is gone; slide 6 states those numbers.
 
 ## E and F. Q&A facts sheet and source card
 
@@ -125,6 +115,6 @@ Written: `docs/CHECKUP-QA.md` (ten questions, the six most likely first, facts a
 | When | Do |
 |---|---|
 | Morning | Plot A and build B from the specs. Fill slides 1, 2, 5 and the backup; merge slides 9 and 10; delete "five modules open". |
-| Midday | C if the Colab download is up; otherwise the committed notebook 01 outputs with "one image" said out loud. D only after C. |
+| Midday | C and D are done: rendered here from the Hugging Face mirror of the dataset (`ferpb/spectralwaste-segmentation`, the same 256 by 256 cubes and `label_hsi_lt` masks, plus the RGB frames). All four figures are in the deck copy. |
 | By 4 PM | Trim notes to the review's per-slide word budgets (about 680 words for 5:00). Dry run with the Q&A sheet. Delete every dashed box. |
 | Nov 5 | G. |
