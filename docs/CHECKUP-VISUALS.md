@@ -4,6 +4,8 @@ Written Tue Nov 3, revised Wed Nov 4, 2026, for the 6 PM progress checkup (5 of 
 
 Jeong treats AI-written presentation content as cheating. So this file, `docs/CHECKUP-QA.md`, and `docs/CHECKUP-SOURCES.md` hold specs, facts, and sources only. Scott plots the figures and writes every word on the slides and in the notes.
 
+`notebooks/04_checkup_figures.ipynb` makes A, B, C, D, and G from the specs below and saves them under `docs/figures/`. Cells A, B, and G need no data; C and D read `SW_ROOT` like notebook 01 and skip themselves without it.
+
 ## What the slides have to carry
 
 `docs/PLAN.md` says the checkup wants three things: the CNN score, evidence the transformer trained on real data, and the Phase 2/3 plan. The deck covers the first and third. The second (artifact G) is deferred to Nov 5 by decision on Nov 4; the deck says "no transformer score" and "designed" instead.
@@ -107,7 +109,7 @@ Written: `docs/CHECKUP-QA.md` (ten questions, the six most likely first, facts a
 - Figure: val FG mIoU per epoch for `runs/transformer` next to the `cnn_ds2` curve, plus train loss, from each run's `metrics.csv`. Any run length counts. Caption carries the run command.
 - Text box: the harness startup lines verbatim: model class, parameter count, class-weight vector.
 - Order: review and merge PR #12; fill `SpatialPE`, `SpatialBlock`, `SegHead` (`docs/TRANSFORMER-TODO.md`); `pytest -q` green; `python -m sw.train --model transformer --smoke --device cpu`; then the Colab command in that file's step 8.
-- Also: copy `cnn_ds2/metrics.csv` from Drive into `docs/runs/cnn_ds2_metrics.csv` (`runs/` is gitignored; the CSV is a few KB) and restore the real cells of notebook 03, so the 0.391 run has per-epoch evidence on GitHub.
+- Also: copy `cnn_ds2/metrics.csv` from Drive into `docs/metrics/cnn_ds2.csv` (`docs/runs/` would be caught by the `runs/` ignore rule; the CSV is a few KB) and restore the real cells of notebook 03, so the 0.391 run has per-epoch evidence on GitHub.
 
 ## Shared style rules
 
