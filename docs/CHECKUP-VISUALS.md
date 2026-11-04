@@ -100,7 +100,9 @@ Say with it: two real label sets, not a model output. The filament zero is the l
 
 ## Bibliography (the `References` slide)
 
-`docs/CHECKUP-BIBLIOGRAPHY.md` lists thirteen entries with what each backs: the paper, the Zenodo release, the Hugging Face mirror, the official code, MiniNet-v2, SegFormer, CMX, ViT, SpectralFormer, SSFT, DeiT and Steiner, our repository, and the two lectures. The same list is the last slide of the deck copy, every entry a clickable link except the lectures, whose Canvas links are Scott's to add. It is the only slide text I wrote, and it is citations.
+`docs/CHECKUP-BIBLIOGRAPHY.md` lists thirteen entries with what each backs: the paper, the Zenodo release, the Hugging Face mirror, the official code, MiniNet-v2, SegFormer, CMX, ViT, SpectralFormer, SSFT, DeiT and Steiner, our repository, and the two lectures. The same list is the last slide of the deck copy (`References`, 13 lines at 11 pt Arial in the content band), every entry a clickable link except the lectures, whose Canvas links are Scott's to add. It is the only slide text I wrote, and it is citations.
+
+Deck copy order after Nov 4: title, outline, domain, spectra figure, prior work, hypothesis, data and metric, data-example figure, metric figure, baseline result with the chart, approach, architecture figure, status, next steps, backup, References. Sixteen slides; the figure slides and References carry copied counters and the parent's notes, which are Scott's to renumber and trim.
 
 ## F. Q&A facts sheet and source card
 
