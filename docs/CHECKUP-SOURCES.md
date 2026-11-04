@@ -13,7 +13,7 @@ Every number on the deck, where it comes from, and the condition to say next to 
 | L5 | MiniNet-v2: <https://doi.org/10.1109/TRO.2020.2974099> | The MiniNet-v2 card: the family MiniNetSeg is drawn from. |
 | L6 | CMX: <https://arxiv.org/abs/2203.04838> | The CMX-B0 card: RGB plus HSI, context only. |
 
-Our own numbers come from the repo, `main` at dacb90e: `docs/RESULTS.md` (the run), `src/sw/data.py` (pixel counts, palette), `src/sw/metrics.py` (FG mIoU), `src/sw/train.py` (downsample applies to val masks too), `src/sw/models/tokenizer.py` with `tests/test_transformer.py` (66,624), and PR #12 (spectral block and pool).
+Our own numbers come from the repo, `main` at 7ea4556: `docs/RESULTS.md` (the run), `src/sw/data.py` (pixel counts, palette), `src/sw/metrics.py` (FG mIoU), `src/sw/train.py` (downsample applies to val masks too), `src/sw/models/tokenizer.py` with `tests/test_transformer.py` (66,624), and `src/sw/models/transformer.py` (spectral block and pool, merged in PR #12).
 
 ## Slide by slide
 
@@ -43,12 +43,12 @@ Our own numbers come from the repo, `main` at dacb90e: `docs/RESULTS.md` (the ru
 | 7 | paper bars full resolution, about 200 epochs | L1 Sec V-A: exactly 200 | "200", not "about 200" |
 | 7 | class-weight sentence | L2 hard-codes RGB counts; we use `labels_hyper_lt` counts; under 1% difference at exponent 0.12 (`docs/RECIPE.md` section 6) | |
 | 8 Approach | 14 by 16 band tokens, patch 8 | `src/sw/models/tokenizer.py` | 66,624 params, merged (PR #9) |
-| 8 | 2 spectral blocks, 6 spatial blocks, D = 64, 4 heads | `BandTransformer` defaults in `src/sw/models/transformer.py` | spectral block and pool in review (PR #12); spatial PE, spatial blocks, head are stubs |
+| 8 | 2 spectral blocks, 6 spatial blocks, D = 64, 4 heads | `BandTransformer` defaults in `src/sw/models/transformer.py` | spectral block and pool merged (PR #12); spatial PE, spatial blocks, head are stubs |
 | 8 | about 0.5M parameters | hand count: 66,624 + 8 x 49,984 = 466,496, plus the head | say about 0.49M everywhere, and "designed" |
 | 8 | 1024 or 256 tokens | 32 by 32 grid at 256 input; 16 by 16 at 128 | |
 | 8 | from-scratch QKV | `src/sw/attention.py`; the test forbids built-in attention | |
 | 9 Status | tokenizer 14 groups, 66,624 | `tests/test_transformer.py` locks it | |
-| 9 | "five modules still open" | outdated: two in review (PR #12), three stubs | match the slide 8 wording |
+| 9 | "five modules still open" | outdated: tokenizer, spectral block and pool merged; three stubs | match the slide 8 wording |
 | 10 Next | Phase 1, 2, 3; Dec 2 | `docs/PLAN.md` | INT8 is "planned" |
 | B Backup | 79.6; 81 instances; 20 images; MA 56.3 | L1 Table II | agreement between LT and manual labels; "ceiling" is our reading |
 

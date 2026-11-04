@@ -10,7 +10,7 @@ Jeong treats AI-written presentation content as cheating. So this file, `docs/CH
 
 `docs/PLAN.md` says the checkup wants three things: the CNN score, evidence the transformer trained on real data, and the Phase 2/3 plan. The deck covers the first and third. The second (artifact G) is deferred to Nov 5 by decision on Nov 4; the deck says "no transformer score" and "designed" instead.
 
-Status wording, the same on slides 8, 9, and 10: the band-token transformer is designed; tokenizer merged (PR #9); spectral block and pool in review (PR #12); spatial PE, spatial blocks, and seg head are stubs.
+Status wording, the same on slides 8, 9, and 10: the band-token transformer is designed; tokenizer merged (PR #9); spectral block and pool merged (PR #12, Nov 4); spatial PE, spatial blocks, and seg head are stubs.
 
 What exists today:
 
@@ -19,7 +19,7 @@ What exists today:
 | CNN run `cnn_ds2`: best val FG mIoU 0.391 at epoch 29, per-class IoU for all 7 classes | `docs/RESULTS.md` |
 | Per-epoch metrics for that run | Scott's Drive only (`sw_runs/cnn_ds2/metrics.csv`). `notebooks/03_train_cnn.ipynb` on `main` is an empty badge cell. |
 | Band tokenizer, 66,624 params, `(B, 1024, 14, 64)` at 256 input | `src/sw/models/tokenizer.py`, merged |
-| `SpectralBlock` (wraps `ResidualSelfAttentionBlock` across the 14 groups) and `SpectralPool` (mean) | Open PR #12, head 86dc065 |
+| `SpectralBlock` (wraps `ResidualSelfAttentionBlock` across the 14 groups) and `SpectralPool` (mean) | Merged into `main` (PR #12, Nov 4) |
 | `SpatialPE`, `SpatialBlock`, `SegHead` | Raise `NotImplementedError` |
 | One-cube figures: false colour, mask, legend, per-class spectrum, pixel counts | `notebooks/01_look_at_the_data.ipynb`, executed Oct 6 on `train[0]` |
 | Train pixel counts per class, class palette | `src/sw/data.py` |
@@ -36,7 +36,7 @@ Constraints: the data is 23 GB and on no machine right now, so anything that rea
 | F | Source card | `docs/CHECKUP-SOURCES.md`, written; copy to the backup slide | No | 10 min | Keep |
 | C | Data example, three panels (TODO 3) | slide 6, or slide 3 for the RGB claim | Yes | 30 min after download | Fall back to the Oct 6 notebook outputs |
 | D | Spectral signature chart, 6 classes over 224 bands | slide 3 or 6, not both with C's panel 3 | Yes | 45 min after download | First to drop |
-| G | Transformer run evidence | Nov 5 | Yes, plus PR #12 and the three stubs | | Deferred |
+| G | Transformer run evidence | Nov 5 | Yes, plus the three stubs | | Deferred |
 
 ## A. Per-class IoU bar chart (slide 7)
 
@@ -63,8 +63,8 @@ One left-to-right strip, one box per stage. Show status with box style plus a wo
 |---|---|---|---|
 | Input cube | (B, 224, 256, 256) | 0 | done (loader) |
 | Band tokenizer: 14 groups of 16 bands, one shared Conv2d 16 to 64 (kernel 8, stride 8), LayerNorm, learned 14 by 64 group embedding | (B, 1024, 14, 64) | 66,624 | merged, PR #9 |
-| Spectral block x2: attention across the 14 groups inside each patch | (B, 1024, 14, 64) | 49,984 each | in review, PR #12 |
-| Spectral pool: mean over groups | (B, 1024, 64) | 0 | in review, PR #12 |
+| Spectral block x2: attention across the 14 groups inside each patch | (B, 1024, 14, 64) | 49,984 each | merged, PR #12 |
+| Spectral pool: mean over groups | (B, 1024, 64) | 0 | merged, PR #12 |
 | Spatial PE: fixed 2D sin-cos on the 32 by 32 grid | (B, 1024, 64) | 0 | stub |
 | Spatial block x6: attention across the 1,024 patches | (B, 1024, 64) | 49,984 each | stub |
 | Seg head: (B, 64, 32, 32) to 7 classes, upsample x8 | (B, 7, 256, 256) | about 0.5k (1x1) to about 21k (recipe head) | stub |
@@ -108,7 +108,7 @@ Written: `docs/CHECKUP-QA.md` (ten questions, the six most likely first, facts a
 
 - Figure: val FG mIoU per epoch for `runs/transformer` next to the `cnn_ds2` curve, plus train loss, from each run's `metrics.csv`. Any run length counts. Caption carries the run command.
 - Text box: the harness startup lines verbatim: model class, parameter count, class-weight vector.
-- Order: review and merge PR #12; fill `SpatialPE`, `SpatialBlock`, `SegHead` (`docs/TRANSFORMER-TODO.md`); `pytest -q` green; `python -m sw.train --model transformer --smoke --device cpu`; then the Colab command in that file's step 8.
+- Order: fill `SpatialPE`, `SpatialBlock`, `SegHead` (`docs/TRANSFORMER-TODO.md`); `pytest -q` green; `python -m sw.train --model transformer --smoke --device cpu`; then the Colab command in that file's step 8.
 - Also: copy `cnn_ds2/metrics.csv` from Drive into `docs/metrics/cnn_ds2.csv` (`docs/runs/` would be caught by the `runs/` ignore rule; the CSV is a few KB) and restore the real cells of notebook 03, so the 0.391 run has per-epoch evidence on GitHub.
 
 ## Shared style rules
