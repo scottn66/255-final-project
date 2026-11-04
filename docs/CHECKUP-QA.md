@@ -4,6 +4,48 @@ Written Nov 4, 2026 for the 1:30 of questions. This sheet holds facts, sources, 
 
 Numbers are the ones already on the deck. Slide numbers are the 10-slide order in the deck copy. Paper = Casao et al., IROS 2024, arXiv 2403.18033.
 
+## Limitation, hypothesis, novelty (a draft to rewrite in your own words)
+
+Jeong's arc for the talk: the limitation of prior work, then a hypothesis that answers it, then the technical novelty stated the way an ECCV reviewer would weigh it. This is the best version I can build from the evidence on hand. Slide 5 and the end of slide 4 are yours to write; nothing here goes on a slide as written.
+
+### The limitation, with the number that proves it
+
+Both published hyperspectral baselines consume the 224 bands through one first convolution: MiniNet-v2 through its stem, SegFormer-B0 through its overlapped patch embedding. The spectral axis is collapsed into feature channels before any spatial reasoning, and nothing downstream can attend across wavelengths. Three facts from the paper show what that costs.
+
+- Table IV: SegFormer-B0 loses only 0.8 points when the 224 bands are replaced by 3 PCA components (HYPER3 53.5 vs HYPER 54.3). The published transformer baseline is using little of the spectrum beyond three components. MiniNet-v2 loses 3.8 (49.0 vs 52.8).
+- Table IV: the thin, look-alike classes stay weak in both models: filament 30.5 / 33.1, tape 28.8 / 21.9, against cardboard at 78.8 / 85.2.
+- The paper has no row that separates the spectral contribution from the spatial one, and no INT8 row.
+
+Our own data figure supports the reading: after each pixel is divided by its mean, film, bag, filament and cardboard separate by spectral shape (dips near 1180 and 1380 nm for film; near 1200 and 1390 for filament and bag; a hard fall past 1600 for cardboard), while tape stays flat. A first convolution that sums bands sees brightness; the shape is what distinguishes the materials.
+
+One-sentence form: "The published baselines collapse the 224 bands in their first layer, and the paper's own PCA-3 row shows the transformer barely uses them."
+
+### The hypothesis, falsifiable, with the margin
+
+Claim limit from the context prompt: "competitive", never "beat"; INT8 is planned.
+
+A from-scratch model that attends over 14 band groups before it attends over space, at no more than 0.6M parameters, will (a) reach a validation FG mIoU within 3 points of MiniNet-v2's 52.8 under the paper's protocol (full resolution, 200 epochs, official split), and (b) beat its own spatial-only ablation by at least 2 points. If (a) fails, the model is not competitive at this size. If (b) fails, attention over bands did not earn its cost, and the honest conclusion is that a spatial model with a learned band reduction is enough. Either outcome is reported.
+
+Why 3 and 2: the paper's numbers are single runs with no seed spread reported. SSFT-style work on hyperspectral data shows about 1 point of seed spread at this model size, so 3 points is about three spreads, and 2 points on the ablation is the smallest difference that would survive a second seed. Say the margins are a judgment, and that the final table runs three seeds (`docs/RECIPE.md` section 5).
+
+What tests it: the Phase 2 rows, spectral-only, spatial-only, both, at matched parameters, on the same split and metric. The brackets on the architecture figure mark what each row removes.
+
+### Technical novelty, stated for an ECCV reader
+
+Contributions, in the order a reviewer would check them:
+
+1. A factorized spectral-then-spatial token attention for dense segmentation at under 0.6M parameters on hyperspectral waste data. The precedents (SSFT at 0.516M, SpectralFormer) are pixel or patch classifiers, and the only segmentation transformers reported on SpectralWaste are SegFormer-B0 at 4.06M and the 11.5M fusion model.
+2. An ablation that isolates the spectral attention's contribution at matched parameters and matched training, which the paper does not report. This is the experiment that answers the limitation above.
+3. A measured INT8 drop for the resulting model, planned for Phase 3, which no SpectralWaste result reports.
+
+An optional fourth row, untested and motivated by the data figure: brightness-invariant band tokens, where each pixel's spectrum is divided by its own mean before tokenization. It is a one-line loader change and, if it moves the thin classes, it becomes the most defensible single technical idea in the project. Do not claim it until it is run.
+
+Not new, and said so: wavelength encoding (technique adoption), grouping bands into tokens (SpectralFormer), the from-scratch training recipe (DeiT, Steiner), the dataset and the metric.
+
+### How to say it in Jeong's frame
+
+Problem in one line, then the limitation with its number (the PCA-3 row), then the hypothesis with its two conditions and margins, then the three contributions, then what is not new. The novelty is moderate and should be called moderate: a new combination on a new dataset, plus the ablation and the deployment measurement that make it a result rather than a demo. A reviewer forgives moderate novelty with a clean experiment; they do not forgive an unfalsifiable claim.
+
 ## The six most likely
 
 ### 1. Is 39.1 comparable to 52.8? Why is it so far below?

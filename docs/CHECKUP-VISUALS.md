@@ -36,6 +36,8 @@ Constraints: the data is 23 GB and on no machine right now, so anything that rea
 | F | Source card | `docs/CHECKUP-SOURCES.md`, written; copy to the backup slide | No | 10 min | Keep |
 | C | Data example: RGB frame, false colour with outlines, mask, spectrum (TODO 3) | its own slide after slide 6 | Yes | done, in the deck | Keep |
 | D | Spectral shape per material, six small multiples, plus a raw version | its own slide after slide 3 | Yes | done, in the deck | Keep |
+| E | The metric on two real label sets: RGB-frame label vs transferred label, agreement map, IoU per class | its own slide after the data example | Yes | done, in the deck | Keep |
+| Bib | Bibliography: every link Jeong asked for, clickable | `References` slide at the end, and `docs/CHECKUP-BIBLIOGRAPHY.md` | No | done, in the deck | Keep |
 | G | Transformer run evidence | Nov 5 | Yes, plus the three stubs | | Deferred |
 
 ## A. Per-class IoU (slide 7)
@@ -90,7 +92,17 @@ Drawn by notebook 04, cell D, committed at 9.28 by 3.90 inches as two files:
 
 What the normalized panels show: film has a sharp dip near 1180 nm and a second near 1380; filament and bag share deep dips near 1200 and 1390 with different slopes; cardboard rises to 1300 and falls hard past 1600; tape is nearly flat. That is the evidence slide 3 needs that look-alike materials separate by spectral shape, which raw brightness hides. The caption percentages (cardboard 60%, filament 42%) are the share of each class's train pixels that sit inside its 8 cubes, not accuracy numbers. The class pixel share panel is gone; slide 6 states those numbers.
 
-## E and F. Q&A facts sheet and source card
+## E. The metric on two real label sets (its own slide after the data example)
+
+Drawn by notebook 04, cell E, committed as `docs/figures/iou_illustration.png` at 9.28 by 3.90 inches. Jeong asked for the metric to be defined; this does it on real masks rather than a toy diagram. For the data-example cube it shows the label drawn on the RGB frame (A), the same label transferred to the HSI frame (B), their agreement map (class colour where both agree, red only in A, blue only in B), and the IoU per class between the two with the formula IoU = TP / (TP + FP + FN) and the FG mean as a dashed line. Numbers: film 0.757, tape 0.576, filament 0.000, bag 0.831, FG mean 0.541 over the four classes present, pixel agreement 0.899. The cell asserts the hand count against `sw.metrics.fg_miou_from_cm` when the package imports.
+
+Say with it: two real label sets, not a model output. The filament zero is the lesson: a 2-pixel-wide curve offset by a few pixels between frames has no overlap, so IoU punishes thin classes for small shifts. That is also why half resolution hurt filament in the CNN run. The paper's Table II (79.6) is a different comparison, transferred vs manual labels on the HSI frame. Needs an RGB-frame label folder (`labels_rgb/train`); the Hugging Face mirror ships it, and the cell skips itself without it.
+
+## Bibliography (the `References` slide)
+
+`docs/CHECKUP-BIBLIOGRAPHY.md` lists thirteen entries with what each backs: the paper, the Zenodo release, the Hugging Face mirror, the official code, MiniNet-v2, SegFormer, CMX, ViT, SpectralFormer, SSFT, DeiT and Steiner, our repository, and the two lectures. The same list is the last slide of the deck copy, every entry a clickable link except the lectures, whose Canvas links are Scott's to add. It is the only slide text I wrote, and it is citations.
+
+## F. Q&A facts sheet and source card
 
 Written: `docs/CHECKUP-QA.md` (ten questions, the six most likely first, facts and traps only, blank answer lines) and `docs/CHECKUP-SOURCES.md` (the six links from TODO item 11, every number on the deck mapped to its source and its condition label). The source card's slide-by-slide table is the backup slide content if a number is challenged.
 
