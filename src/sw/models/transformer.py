@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from sw.models.tokenizer import BandTokenizer
+from sw.attention import ResidualSelfAttentionBlock
 
 
 def _check_block_args(dim: int, heads: int, mlp_ratio: float) -> None:
@@ -48,9 +49,14 @@ class SpectralBlock(nn.Module):
     def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
         super().__init__()
         _check_block_args(dim, heads, mlp_ratio)
+        if mlp_ratio != 4.0:
+            raise NotImplementedError(
+                "SpectralBlock only supports mlp_ratio=4.0 for now. Use FeedForward for other ratios."
+            )
         self.dim = dim
         self.heads = heads
         self.mlp_ratio = mlp_ratio
+        self.attn_block = ResidualSelfAttentionBlock(dim, heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, N, G, D) -> (B, N, G, D)``.
@@ -66,9 +72,11 @@ class SpectralBlock(nn.Module):
         the MLP fixed at ``4 * dim``. Any other ``mlp_ratio`` needs
         ``FeedForward`` with the hidden width above.
         """
-        raise NotImplementedError(
-            "TODO(tim): SpectralBlock. Attention across the G band-group axis."
-        )
+        b, n, g, d = x.shape
+        x = x.reshape(b * n, g, d)
+        x, _ = self.attn_block(x)
+        x = x.reshape(b, n, g, d)
+        return x
 
 
 class SpectralPool(nn.Module):
@@ -76,7 +84,7 @@ class SpectralPool(nn.Module):
 
     Input ``(B, N, G, D)``. Output ``(B, N, D)``.
 
-    The reduction is a TODO. Suggested owner: Tim.
+    FOR NOW, the pool is a mean over ``G``.
     """
 
     def __init__(self, dim: int):
@@ -84,7 +92,6 @@ class SpectralPool(nn.Module):
         if dim < 1:
             raise ValueError(f"dim must be >= 1, got {dim}")
         self.dim = dim
-        # TODO(tim): mean over G (recipe default, 0 parameters) or a learned token.
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, N, G, D) -> (B, N, D)``.
@@ -93,10 +100,7 @@ class SpectralPool(nn.Module):
         width ``dim`` (a cross-attention query, or a learned weighted sum
         over ``G``). The output has no ``G`` axis.
         """
-        raise NotImplementedError(
-            "TODO(tim): SpectralPool. Reduce G to one vector per spatial token."
-        )
-
+        return x.mean(dim=2) 
 
 class SpatialPE(nn.Module):
     """Add a 2D position embedding on an ``h`` by ``w`` token grid.
