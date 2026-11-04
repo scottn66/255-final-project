@@ -30,24 +30,25 @@ Constraints: the data is 23 GB and on no machine right now, so anything that rea
 
 | # | Artifact | Deck slot | Needs data | Time | Cut line |
 |---|---|---|---|---|---|
-| A | Per-class IoU, grouped bars with the gap (TODO 7) | slide 7 | No | done, 8397ff3 | Keep |
-| B | Architecture strip, current vs goal (TODO 2) | slide 8 | No | done, 8397ff3 | Keep |
+| A | Per-class IoU, grouped bars, gap, 39.1 and 52.8 lines (TODO 7) | slide 7 | No | done | Keep |
+| B | Architecture strip with lecture tie-ins and ablation brackets (TODO 2) | slide 8 | No | done | Keep |
 | E | Q&A facts sheet | `docs/CHECKUP-QA.md`, written | No | answers only | Keep |
 | F | Source card | `docs/CHECKUP-SOURCES.md`, written; copy to the backup slide | No | 10 min | Keep |
-| C | Data example, three panels (TODO 3) | slide 6, or slide 3 for the RGB claim | Yes | done, 8397ff3 | Keep |
-| D | Mean spectrum per class, 8 richest cubes each | slide 3 or 6, not both with C's panel 3 | Yes | done, 8397ff3 | Keep |
+| C | Data example: RGB frame if shipped, false colour with outlines, mask, spectrum (TODO 3) | slide 6, or slide 3 for the RGB claim | Yes | cell redrawn; one Colab rerun | Keep |
+| D | Spectral shape per material, six small multiples, plus a raw version | slide 3 or 6, not both with C's panel 3 | Yes | cell redrawn; one Colab rerun | Keep |
 | G | Transformer run evidence | Nov 5 | Yes, plus the three stubs | | Deferred |
 
 ## A. Per-class IoU (slide 7)
 
-Drawn by notebook 04, cell A, committed as `docs/figures/per_class_iou.png` (8397ff3):
+Drawn by notebook 04, cell A, committed as `docs/figures/per_class_iou.png`:
 
 - Grouped horizontal bars per object class. The upper bar is ours in the class colour, the lower bar is the paper's MiniNet-v2 HYPER row in light grey, both with the value printed. MiniNet-v2 is the fair reference because MiniNetSeg is from the same family.
-- Classes are sorted by the gap, paper minus ours, and that gap is printed on the right edge in points: filament 30.5, cardboard 21.0, bag 12.7, basket 11.5, film 6.0, tape 0.2.
-- The zero filament bar gets a small green marker at the axis and a bold "0.0", so it reads as a result.
-- The title's second line states the claim: FG mIoU 39.1 vs paper 52.8, filament and cardboard are 63% of the gap.
-- Footer: the condition line (MiniNetSeg, 571,879 params; half resolution for cube and mask; 30 epochs; val; best epoch 29; one run; background 86.8 not in the mean) and the source (Table IV; SegFormer-B0 HYPER 54.3 named as context, not drawn).
-- Percent axis 0 to 100, matching the 39.1 on the card.
+- Classes are sorted by the gap, paper minus ours, and the gap is printed after each pair: filament 30.5, cardboard 21.0, bag 12.7, basket 11.5, film 6.0, tape 0.2. No second axis.
+- Two vertical lines draw the headline numbers, 39.1 and 52.8, instead of only stating them.
+- The filament row carries the rare-class fact, 0.098% of train pixels and a loss weight of only 1.5x, so the row hands off to the next-steps slide as the meta-deck asks.
+- The zero filament bar gets a small green marker at the axis and a bold "0.0".
+- Title: FG mIoU 39.1 vs paper 52.8, filament and cardboard are 63% of the gap. Footer: the condition line in two short lines.
+- Percent axis 0 to 100. Drawn on a 13.33 by 7.5 inch canvas with 13 to 16 pt type, so it reads from the back of the room.
 
 ## B. Architecture strip, current vs goal (slide 8)
 
@@ -74,7 +75,7 @@ The CNN control can be a second, thinner row if there is room: 1x1 band mix 224 
 
 Build in Slides with shapes so it stays editable during the dry run. An SVG in `docs/figures/architecture.svg` is the fallback; it needs no data and no torch.
 
-Drawn by notebook 04, cell B, committed as `docs/figures/architecture.png` and `.svg` (8397ff3), with the spectral block and pool solid (merged, PR #12), the three stubs dashed, and the subtitle "Merged through the spectral pool. The three dashed stages are still stubs, so there is no transformer score."
+Drawn by notebook 04, cell B, committed as `docs/figures/architecture.png` and `.svg`: the spectral block and pool solid (merged, PR #12), the three stubs dashed, a lecture tie-in under each box title (L1 patch and position embedding, L1 QKV from `nn.Linear` plus softmax, L9 segmentation head, L9 mIoU), brackets over the stages each Phase 2 ablation row removes, and a subtitle that says from scratch, no pretrained weights, about 0.49M designed, and states the hypothesis. The footer keeps the half-resolution grid, the next steps, and Phase 3 INT8 as planned. The canvas is 13.33 by 7.5 inches with the axes filling it, so box text is sized against the real slide width.
 
 ## C. Data example, three panels (slide 6, or slide 3 for the RGB claim)
 
@@ -88,13 +89,16 @@ Notebook 01 already draws all three pieces for `train[0]`, which has only film, 
 - 900 to 1700 nm is all infrared, so the cube cannot show what an RGB camera sees. A true RGB comparison needs the dataset's RGB images, which the loader does not read. Do not present the false-colour panel as "what RGB sees".
 - Caption: "One train cube, 224 by 256 by 256, uint16 scaled to [0, 1]. Masks are label-transfer masks (`labels_hyper_lt`), 79.6 mIoU against manual labels in the paper's Table II."
 
-Drawn by notebook 04, cell C, committed as `docs/figures/data_example.png` (8397ff3). The chosen cube is `20221028_02_092121` with film, tape, filament (657 px, the thin green curve), and bag. The spectrum panel carries a legend with each class's pixel count in that cube and uses the loader's scaled values, not the display stretch. Film and background run close together in this cube; say so if asked, since that is where a model confuses classes.
+Drawn by notebook 04, cell C. The committed `docs/figures/data_example.png` is the earlier version (cube `20221028_02_092121` with film, tape, filament at 657 px, and bag). The cell now adds the release's RGB frame as a first panel when an `rgb/train` folder exists next to `hyper/` (the only honest way to show what a colour camera sees), draws the label outlines over the false colour so the transferred masks can be judged against the scene, and names the closest pair of class means in the cube, which is where a model confuses classes. One Colab run of the cell refreshes the file.
 
-## D. Mean spectrum per class, 8 richest cubes each (slide 3 or 6)
+## D. Spectral shape per material (slide 3 or 6)
 
-Drawn by notebook 04, cell D, committed as `docs/figures/band_signatures.png` (8397ff3). For each object class the cell takes the 8 train cubes with the most pixels of that class (every mask scanned, only those 47 cubes read) and plots the mean of the 8 per-cube mean spectra. Only cardboard carries a plus or minus 1 sd band, because shading every class hid the lines. Background is the background pixels of those same cubes. The 14 token groups are striped, the three false-colour bands dotted, and the top axis is nominal nm with the even-spacing caveat written out. The right panel is the class share of all train pixels, a different population, and its title says so.
+Drawn by notebook 04, cell D. The committed `docs/figures/band_signatures.png` is the earlier single-panel version (8 richest cubes per class, raw brightness, cardboard shaded). The cell now makes two files, and one Colab run refreshes them:
 
-Two cautions for the slide. The title's "overlap" is a reading: film, bag, and filament run about 0.05 to 0.08 above the background curve with the same shape, so "run close to the background" is the safer wording if challenged. The legend percentages (cardboard 60%, filament 42%) are the share of each class's train pixels that sit inside its 8 cubes, not accuracy numbers.
+- `band_signatures.png`: six small multiples, one object class per panel, with each pixel's spectrum divided by its own mean before averaging. Brightness from illumination and thickness drops out, so only the shape stays, which is the evidence slide 3 needs that look-alike materials separate by spectrum. The highlighted class carries a plus or minus 1 sd band across its 8 cubes; the other classes are grey; background is dotted. Identity comes from the panel, not from colour alone. The x axis is nominal nm with the even-spacing caveat.
+- `band_signatures_raw.png`: the same grid on raw scaled values, for the backup.
+
+The class pixel share panel is gone; slide 6 states those numbers. The caption percentages (cardboard 60%, filament 42%) are the share of each class's train pixels that sit inside its 8 cubes, not accuracy numbers.
 
 ## E and F. Q&A facts sheet and source card
 
