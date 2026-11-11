@@ -1,0 +1,165 @@
+# MiniNetSeg INT8 probe — Computer 3 commands.
+#
+# Draft lab toolkit. Not a submission. Not for Canvas.
+# Do not merge. Scott Nelson reviews every line before anyone runs this.
+#
+# Two phases, modeled on Lab 2:
+#   Phase 1  compile inside Docker (qbcompiler). Does not score.
+#   Phase 2  score outside Docker with maccel. This books the NPU.
+# Export can happen on any machine that has the checkpoint. It does not need
+# the NPU and it does not need the compiler image.
+#
+# Version strings below are the Lab 2 notes. This file does not confirm what
+# is installed on Computer 3 today. Print the versions you actually import
+# and keep that printout with the metrics.
+#
+#   Docker image: mobilint/qbcompiler:0.12-cpu-ubuntu22.04
+#   Wheel:        qubee-0.12.0.0+aries2-py3-none-any.whl
+#   Runtime:      maccel-0.30.1   (outside Docker)
+#
+# Layout: default NCHW float32 (1, 224, 128, 128) -> logits (1, 7, 128, 128).
+# Do not pass --nhwc unless you are running the explicit layout probe.
+# --nhwc is unconfirmed against Jeong's announcement 5928848 scripts.
+# A collapsed val FG mIoU is usually layout or calibration, not the weights.
+# Do not invent a uint8 cube. Do not score CPU INT8 as the NPU result.
+# Do not calibrate on val or test. Train cubes only, about 100-200.
+
+# -----------------------------------------------------------------------------
+# Paths. Fill these in on the machine. Do not commit the files they point at.
+# -----------------------------------------------------------------------------
+# REPO=.../255-final-project
+# SW_ROOT=...            # folder that contains hyper/ and labels_hyper_lt/
+# CHECKPOINT=.../sw_runs/cnn_ds2/best.pt
+#   Google Drive original: MyDrive/sw_runs/cnn_ds2/best.pt
+# QUBEE_WHEEL=.../qubee-0.12.0.0+aries2-py3-none-any.whl
+# WORK=/tmp/cnn_int8_pilot
+# mkdir -p "$WORK"
+
+# -----------------------------------------------------------------------------
+# Export (no Docker, no NPU). Static batch 1, opset 13 probe default.
+# -----------------------------------------------------------------------------
+# cd "$REPO"
+# PYTHONPATH=src python experiments/cnn_int8_pilot/export_onnx.py \
+#   --checkpoint "$CHECKPOINT" \
+#   --out "$WORK/mininet_seg_ds2.onnx"
+# The script exits if CHECKPOINT is missing.
+
+# -----------------------------------------------------------------------------
+# Calibration npy from the TRAIN split only. Same preprocess as the export:
+# uint16 tiff / 65535, prepare_sample(train=False, crop_size=None, downsample=2).
+# -----------------------------------------------------------------------------
+# PYTHONPATH=src python experiments/cnn_int8_pilot/convert_mxq.py \
+#   --materialize-calib \
+#   --data-root "$SW_ROOT" \
+#   --calib-dir "$WORK/calib" \
+#   --calib-count 150 \
+#   --seed 0
+# This command does not call mxq_compile.
+
+# -----------------------------------------------------------------------------
+# Phase 1 — compile inside the Lab 2 compiler image.
+# Do not run the NPU score in this container.
+# -----------------------------------------------------------------------------
+# docker run --rm -it \
+#   -v "$REPO":/work/repo \
+#   -v "$WORK":/work/out \
+#   -v "$QUBEE_WHEEL":/work/qubee.whl \
+#   -w /work/repo \
+#   mobilint/qbcompiler:0.12-cpu-ubuntu22.04 \
+#   bash
+#
+# Inside the container (this is still phase 1, compile only):
+#   python -c 'import qubee' || pip install /work/qubee.whl
+#   python -c 'import qubee; print(getattr(qubee, "__version__", "no __version__"))'
+#   PYTHONPATH=src python experiments/cnn_int8_pilot/convert_mxq.py \
+#     --onnx /work/out/mininet_seg_ds2.onnx \
+#     --calib-dir /work/out/calib \
+#     --out /work/out/mininet_seg_ds2.mxq \
+#     2>&1 | tee /work/out/compile.log
+# Record the qubee version the container prints. Do not assume it still says 0.12.
+#
+# Flags the script sends (do not edit them for the first attempt):
+#   quantization_mode=2
+#   quantization_method=1
+#   percentile=0.999
+#   quantization_output=0          # 0.12 quick start, per-layer output quant
+#   backend=onnx
+#   device=cpu
+#   sample_dtype=float             # 0.12 debug-sample default, not a uint8 contract
+#   use_random_calib=False
+#   cpu_offload=False
+#
+# If the NPU foreground mIoU later drops more than 0.1 versus FP32, recompile
+# once with --percentile 0.9999 and keep both logs. That is not the first call.
+#
+# A compiler error on depthwise, dilated depthwise, unfused BatchNorm,
+# bilinear Resize, or Concat is data. Do not patch MiniNetSeg inside the
+# container to make the compile succeed.
+
+# -----------------------------------------------------------------------------
+# Phase 2 — score OUTSIDE Docker with maccel. This books the NPU.
+# Do not run this from CI, and do not run it until Scott has accepted the kit.
+# CPU INT8 / ONNX Runtime INT8 is not the number this phase records.
+# -----------------------------------------------------------------------------
+# Use the lab machine's existing maccel 0.30.1 install.
+# Do not pip install a substitute runtime.
+#
+# python -c "import maccel; print(getattr(maccel, \"__version__\", \"no __version__\"))"
+#
+# Then, from "$REPO" with PYTHONPATH=src, score val only.
+# Pseudocode (fill in after review; this file is not executed by the PR):
+#
+#   import json, sys, time
+#   import numpy as np
+#   import onnxruntime as ort
+#   import maccel
+#   from sw.data import SpectralWasteDataset
+#   from sw.metrics import ConfusionMeter
+#   from sw.models.cnn import MiniNetSeg
+#   sys.path.insert(0, "experiments/cnn_int8_pilot")
+#   from convert_mxq import preprocess_train_cube
+#   # preprocess_train_cube is the inference geometry (no flip), despite the name.
+#   # Call it with downsample=2, height=128, width=128, bands=224, nhwc=False.
+#
+#   # FP32 PyTorch. model.eval(), weights from best.pt["model"].
+#   # FP32 ONNX Runtime:
+#   #   sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+#   #   logits = sess.run(["logits"], {"cube": nchw_f32})[0]
+#   # These two val FG mIoU numbers should be within about 0.1. If they are not,
+#   # the export is wrong. Stop before quoting an NPU number.
+#   #
+#   # INT8 NPU, float32 at the boundary:
+#   #   model = maccel.Model(mxq_path)
+#   #   model.launch(maccel.Accelerator(0))   # books /dev/aries0; hardware string
+#   #   logits = model.infer(nchw_f32)[0]     # not infer_to_float; not uint8
+#   # If infer rejects the batch axis or the rank, record the error.
+#   # Do not transpose to NHWC unless the export was made with --nhwc.
+#   # Permute NHWC logits back to NCHW before ConfusionMeter.
+#   #
+#   # Latency, after the accuracy loop, batch 1, one val cube reused:
+#   #   for _ in range(20): model.infer(nchw_f32)          # warm-up, not timed
+#   #   samples = []
+#   #   for _ in range(200):
+#   #       t0 = time.perf_counter()
+#   #       model.infer(nchw_f32)
+#   #       samples.append((time.perf_counter() - t0) * 1e3)
+#   #   median = float(np.median(samples))
+#   #   p90 = float(np.percentile(samples, 90))
+#   # Lab 2 context only, not a forecast: 14.0 ms on a 0.12M dense fused net
+#   # (~0.04 dB float-to-NPU drop); 411 ms on a 9.4M class model.
+#   #
+#   # json.dump({
+#   #   "fp32_pytorch_val_fg_miou": ...,
+#   #   "fp32_onnxruntime_val_fg_miou": ...,
+#   #   "int8_npu_val_fg_miou": ...,
+#   #   "latency_ms": {"batch": 1, "warmup": 20, "n": 200, "median": median, "p90": p90},
+#   #   "qubee_version": "...",          # printed in phase 1
+#   #   "maccel_version": "...",         # printed above
+#   #   "hardware": "...",               # whatever Accelerator launch prints
+#   #   "layout": "nchw",
+#   #   "percentile": 0.999,
+#   #   "note": "CPU INT8 is not an NPU result",
+#   # }, open("/work/out/metrics.json", "w"), indent=2)
+#
+# Copy off the machine: the mxq, compile.log, the timing record, metrics.json,
+# and the qubee / maccel version strings. Do not commit them.

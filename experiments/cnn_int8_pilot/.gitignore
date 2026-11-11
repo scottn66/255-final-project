@@ -1,0 +1,9 @@
+# Local probe artifacts. Never commit weights, cubes, or compiled models.
+*.pt
+*.pth
+*.onnx
+*.onnx.data
+*.mxq
+*.npy
+*.log
+calib/
