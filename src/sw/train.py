@@ -1,16 +1,24 @@
 """Training harness for SpectralWaste.
 
 ``--model cnn`` (the default) is ``MiniNetSeg``. ``--model transformer``
-is the band-token scaffold in ``sw.models.transformer``. That forward
-raises ``NotImplementedError`` until the TODOs in
-``docs/TRANSFORMER-TODO.md`` are filled in. Leaving ``--model`` unset
-keeps the CNN path.
+is the band-token transformer in ``sw.models.transformer`` (488,487
+parameters at the defaults). Leaving ``--model`` unset keeps the CNN path.
 
 ``train(model, cfg)`` runs AdamW and weighted cross-entropy, reports
 foreground mIoU on the validation split after every epoch, and writes
 ``best.pt``, ``last.pt``, ``metrics.jsonl``, and ``metrics.csv`` under
 ``cfg.out_dir``. ``last.pt`` is the resume file (model, optimizer,
 scheduler, epoch, best foreground mIoU). ``best.pt`` is the best weights.
+
+Each ``metrics.jsonl`` row also has the training-set FG mIoU and per-class
+IoU of that epoch and its wall time; ``metrics.csv`` keeps its original
+columns so older runs can still be resumed.
+
+The overfit-one-batch check (no augmentation, 4 images; the pass rule is
+in ``docs/COLAB.md``) is::
+
+    PYTHONPATH=src python -m sw.train --model transformer --downsample 2 --no-aug \
+        --no-cosine --max-train-images 4 --max-val-images 4 --batch-size 4 --epochs 200
 
 Run it from the repo root:
 
@@ -34,6 +42,7 @@ import csv
 import json
 import math
 import random
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -43,7 +52,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from sw.data import CLASS_NAMES, SpectralWasteDataset, class_weights
-from sw.metrics import ConfusionMeter
+from sw.metrics import NUM_CLASSES, ConfusionMeter, fg_miou_from_cm
 from sw.models.cnn import MiniNetSeg, count_parameters
 from sw.models.transformer import BandTransformer
 
@@ -78,6 +87,15 @@ class TrainConfig:
     ``model`` is ``"cnn"`` (``MiniNetSeg``) or ``"transformer"``
     (``BandTransformer``). The depth, width, head, MLP, patch, and group
     fields size the transformer. A CNN run stores them and leaves them unused.
+
+    ``augment=False`` turns off the training flips and makes a training crop
+    a center crop, so every epoch sees exactly the same pixels. It is for
+    the overfit-one-batch check.
+
+    Batch size: the CNN has BatchNorm, so it needs at least 2 images per
+    training batch. The transformer has no batch statistics and may train
+    on batches of 1. A transformer ``crop_size`` must be a multiple of
+    ``patch``: the tokenizer would drop the remainder anyway.
     """
 
     data_root: str | None = None
@@ -107,6 +125,7 @@ class TrainConfig:
     mlp_ratio: float = 4.0
     patch: int = 8
     group: int = 16
+    augment: bool = True
 
 
 def resolve_device(name: str) -> torch.device:
@@ -253,6 +272,28 @@ def _iou_payload(iou) -> dict:
     return payload
 
 
+def _count_pairs(counts: torch.Tensor, logits: torch.Tensor, masks: torch.Tensor) -> None:
+    """Add this batch's (true, predicted) pixel pairs to ``counts`` in place.
+
+    ``counts`` is a flat ``NUM_CLASSES ** 2`` tensor on the training device,
+    so the training metric needs no copy to the CPU and no GPU sync inside
+    the step; it is read once per epoch. Entry ``t * NUM_CLASSES + p``
+    counts pixels of true class ``t`` predicted as ``p`` (the layout of
+    ``sw.metrics.confusion_matrix``).
+
+    Labels are not range-checked here, since that check would force a sync:
+    an out-of-range label already fails in the loss, and it would also
+    make ``counts`` longer than ``NUM_CLASSES ** 2``, which fails when the
+    epoch reshapes it.
+    """
+    pred = logits.argmax(dim=1)
+    pairs = masks.reshape(-1).long() * NUM_CLASSES + pred.reshape(-1)
+    if counts.device.type == "mps":  # count on the CPU there, to be safe
+        counts += torch.bincount(pairs.cpu(), minlength=NUM_CLASSES**2).to(counts.device)
+    else:
+        counts += torch.bincount(pairs, minlength=NUM_CLASSES**2)
+
+
 def _evaluate(model, loader, device) -> tuple[float, dict]:
     model.eval()
     meter = ConfusionMeter()
@@ -263,10 +304,17 @@ def _evaluate(model, loader, device) -> tuple[float, dict]:
     return meter.fg_miou(), _iou_payload(meter.per_class_iou())
 
 
+def _has_batchnorm(model: nn.Module) -> bool:
+    return any(isinstance(module, nn.modules.batchnorm._BatchNorm) for module in model.modules())
+
+
 def _check_cfg(cfg: TrainConfig) -> None:
     if cfg.epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {cfg.epochs}")
-    if cfg.batch_size < 2:
+    if cfg.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}")
+    # Only the CNN has BatchNorm, which cannot estimate a variance from one image.
+    if cfg.model != "transformer" and cfg.batch_size < 2:
         raise ValueError(
             f"batch_size must be >= 2 so BatchNorm does not train on a batch of 1, got {cfg.batch_size}"
         )
@@ -298,6 +346,11 @@ def _check_cfg(cfg: TrainConfig) -> None:
             raise ValueError(f"patch must be >= 1, got {cfg.patch}")
         if cfg.group < 1:
             raise ValueError(f"group must be >= 1, got {cfg.group}")
+        if cfg.crop_size is not None and cfg.crop_size % cfg.patch != 0:
+            raise ValueError(
+                f"crop_size {cfg.crop_size} must be a multiple of patch {cfg.patch}; "
+                "the tokenizer drops the remainder and the head only pads it"
+            )
 
 
 def _log_mode(path: Path, resume: bool) -> str:
@@ -381,19 +434,28 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     crops, and shuffle follow ``cfg.seed`` on their own.
     """
     _check_cfg(cfg)
+    # BatchNorm (the CNN) needs 2 or more images per training batch. The
+    # check reads the model too, so a BatchNorm model is caught whatever
+    # cfg.model says, before any data is read or any folder is made.
+    needs_two = cfg.model != "transformer" or _has_batchnorm(model)
+    if needs_two and cfg.batch_size < 2:
+        raise ValueError(
+            f"batch_size must be >= 2 so BatchNorm does not train on a batch of 1, got {cfg.batch_size}"
+        )
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
     model = model.to(device)
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds = _split(cfg, "train", cfg.max_train_images, train=True)
+    # augment=False: no flips, and a training crop is a center crop.
+    train_ds = _split(cfg, "train", cfg.max_train_images, train=cfg.augment)
     val_ds = _split(cfg, "val", cfg.max_val_images, train=False)
-    if len(train_ds) < 2:
+    if needs_two and len(train_ds) < 2:
         raise RuntimeError(
             "Need at least 2 training images. BatchNorm cannot train on a batch of 1."
         )
-    drop_last = _train_drop_last(len(train_ds), cfg.batch_size)
+    drop_last = needs_two and _train_drop_last(len(train_ds), cfg.batch_size)
     if drop_last:
         print(
             "train loader drop_last: leaving out 1 image "
@@ -436,7 +498,8 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     )
     print(
         f"train images {len(train_ds)}  val images {len(val_ds)}  "
-        f"downsample {cfg.downsample}  crop {cfg.crop_size}  out {out_dir}"
+        f"downsample {cfg.downsample}  crop {cfg.crop_size}  "
+        f"augment {'on' if cfg.augment else 'off'}  out {out_dir}"
     )
     rounded = " ".join(f"{value:.3f}" for value in weights.detach().cpu().tolist())
     print(f"class weights ({cfg.weight_scheme}): {rounded}")
@@ -468,8 +531,14 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
             loss_sum = 0.0
             seen = 0
             steps = 0
+            # Training-set confusion counts from the predictions each step
+            # already makes: train mode, before that step's update. They lag
+            # the weights by up to one epoch, and with dropout or drop path
+            # on they read low. No extra forward pass; counted on the device.
+            train_counts = torch.zeros(NUM_CLASSES**2, dtype=torch.long, device=device)
+            epoch_start = time.perf_counter()
             for cubes, masks in train_loader:
-                if cubes.shape[0] < 2:
+                if needs_two and cubes.shape[0] < 2:
                     raise RuntimeError(
                         f"training batch has {cubes.shape[0]} image(s); "
                         "BatchNorm needs at least 2. The train loader should have dropped this tail."
@@ -478,7 +547,9 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 masks = masks.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                    loss = criterion(model(cubes), masks)
+                    logits = model(cubes)
+                    loss = criterion(logits, masks)
+                _count_pairs(train_counts, logits.detach(), masks)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -490,6 +561,9 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
             if steps == 0:
                 raise RuntimeError("no training steps ran; check batch_size and the split size")
             train_loss = loss_sum / seen
+            train_cm = train_counts.cpu().numpy().reshape(NUM_CLASSES, NUM_CLASSES)  # the one copy per epoch
+            train_seconds = time.perf_counter() - epoch_start
+            train_score, train_iou = fg_miou_from_cm(train_cm)
             score, per_class = _evaluate(model, val_loader, device)
             epochs_ran = epoch
             record = {
@@ -498,6 +572,10 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 "val_fg_miou": None if math.isnan(score) else score,
                 "steps": steps,
                 "per_class_iou": per_class,
+                "train_fg_miou": None if math.isnan(train_score) else train_score,
+                "train_per_class_iou": _iou_payload(train_iou),
+                "train_seconds": round(train_seconds, 3),  # the training pass
+                "epoch_seconds": round(time.perf_counter() - epoch_start, 3),  # training + validation
             }
             jsonl_file.write(json.dumps(record) + "\n")
             jsonl_file.flush()
@@ -513,10 +591,12 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
             writer.writerow(row)
             csv_file.flush()
             shown = "nan" if math.isnan(score) else f"{score:.4f}"
+            train_shown = "nan" if math.isnan(train_score) else f"{train_score:.4f}"
             current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"epoch {epoch:02d}  steps {steps:4d}  lr {current_lr:.6g}  "
-                f"train_loss {train_loss:.4f}  val_fg_miou {shown}"
+                f"train_loss {train_loss:.4f}  train_fg_miou {train_shown}  val_fg_miou {shown}  "
+                f"{record['epoch_seconds']:.1f}s"
             )
 
             improved = math.isfinite(score) and score > best
@@ -586,7 +666,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         choices=["cnn", "transformer"],
         default="cnn",
-        help="cnn is MiniNetSeg. transformer is the band-token scaffold.",
+        help="cnn is MiniNetSeg. transformer is the band-token transformer (BandTransformer).",
     )
     parser.add_argument(
         "--depth-spectral",
@@ -630,7 +710,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data-root", default=None, help="Dataset folder. Default: the SW_ROOT environment variable.")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Default: 4, or 2 with --smoke. The transformer may use 1; the CNN needs 2 or more.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--crop-size", type=int, default=None, help="Square crop after downsampling. Default: full image.")
@@ -677,6 +762,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Stop each epoch after this many optimizer steps. Default: all, or 2 with --smoke.",
+    )
+    parser.add_argument(
+        "--no-aug",
+        action="store_true",
+        help="No training flips, and a center crop. For the overfit-one-batch check.",
     )
     parser.add_argument(
         "--no-cosine",
@@ -728,7 +818,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
     return TrainConfig(
         data_root=args.data_root,
         epochs=1 if smoke else args.epochs,
-        batch_size=2 if smoke else args.batch_size,
+        batch_size=args.batch_size if args.batch_size is not None else (2 if smoke else 4),
         lr=args.lr,
         weight_decay=args.weight_decay,
         crop_size=args.crop_size,
@@ -753,6 +843,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         mlp_ratio=args.mlp_ratio,
         patch=args.patch,
         group=args.group,
+        augment=not args.no_aug,
     )
 
 
