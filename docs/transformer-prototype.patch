@@ -1,0 +1,1291 @@
+diff --git a/src/sw/models/tokenizer.py b/src/sw/models/tokenizer.py
+index 367b1f4..b3649c0 100644
+--- a/src/sw/models/tokenizer.py
++++ b/src/sw/models/tokenizer.py
+@@ -35,4 +35,38 @@ class BandTokenizer(nn.Module):
+         d, h, w = t.shape[1:]
+         t = t.reshape(b, self.n_groups, d, h, w).permute(0, 3, 4, 1, 2)
+         t = self.norm(t.reshape(b, h * w, self.n_groups, d))   # (B, h*w, G, D)
+-        return t + self.group_emb(), (h, w)
+\ No newline at end of file
++        return t + self.group_emb(), (h, w)
++
++
++class CollapsedTokenizer(nn.Module):
++    """Control tokenizer: mix all bands first, then patch-embed.
++
++    ``(B, C, H, W) -> tokens (B, h*w, 1, D)`` and the ``(h, w)`` grid. There
++    is one group (``G = 1``), so the band axis is gone before any attention.
++
++    A 1x1 conv reduces ``n_bands`` to ``reduce`` channels, then the same
++    ``Conv2d(reduce -> D, patch, patch)`` and LayerNorm as ``BandTokenizer``.
++    With ``reduce = 16`` it has 69,328 parameters against 66,624 for the band
++    tokenizer. Unlike ``BandTokenizer`` plus a mean over groups, it can tell
++    which part of the spectrum a feature sits in. Use it with
++    ``depth_spectral=0`` as the band-collapsed row of the Phase 2 ablation.
++    """
++
++    def __init__(self, n_bands=224, d_model=64, reduce=16, patch=8):
++        super().__init__()
++        if reduce < 1:
++            raise ValueError(f"reduce must be >= 1, got {reduce}")
++        self.n_bands = n_bands
++        self.group = n_bands
++        self.n_groups = 1
++        self.reduce = nn.Conv2d(n_bands, reduce, kernel_size=1)
++        self.proj = nn.Conv2d(reduce, d_model, kernel_size=patch, stride=patch)
++        self.norm = nn.LayerNorm(d_model)
++
++    def forward(self, x):
++        if x.shape[1] != self.n_bands:
++            raise ValueError(f"Input has {x.shape[1]} bands but tokenizer expects {self.n_bands}")
++        t = self.proj(self.reduce(x))  # (B, D, h, w)
++        h, w = t.shape[-2:]
++        t = self.norm(t.flatten(2).transpose(1, 2))  # (B, h*w, D)
++        return t.unsqueeze(2), (h, w)  # (B, h*w, 1, D)
+diff --git a/src/sw/models/transformer.py b/src/sw/models/transformer.py
+index 55d843f..823488a 100644
+--- a/src/sw/models/transformer.py
++++ b/src/sw/models/transformer.py
+@@ -1,27 +1,24 @@
+-"""Band-token transformer scaffold.
++"""Band-token transformer.
+ 
+ ``BandTransformer.forward`` is wiring only. It runs the tokenizer, then
+ spectral blocks, a pool over band groups, a 2D spatial position
+-embedding, spatial blocks, and a segmentation head.
+-
+-``SpectralBlock``, ``SpectralPool``, ``SpatialPE``, ``SpatialBlock``, and
+-``SegHead`` raise ``NotImplementedError``. The steps are in each forward
+-docstring. Fill those in; do not rewrite the composition in
+-``BandTransformer.forward``.
++embedding, spatial blocks, and a segmentation head. Do not rewrite that
++composition; change the modules it calls.
+ 
+ Attention inside the blocks has to be ``sw.attention`` (our ``nn.Linear``
+ and softmax). Do not call nn.MultiheadAttention or drop in a library ViT
+-block. Suggested owners and the order to fill the bodies are in
+-``docs/TRANSFORMER-TODO.md``.
++block. The plan and the measured numbers are in
++``docs/TRANSFORMER-PLAN.md``.
+ """
+ 
+ from __future__ import annotations
+ 
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ 
+-from sw.models.tokenizer import BandTokenizer
+-from sw.attention import ResidualSelfAttentionBlock
++from sw.attention import FeedForward, MultiHeadSelfAttention, ResidualSelfAttentionBlock
++from sw.models.tokenizer import BandTokenizer, CollapsedTokenizer
+ 
+ 
+ def _check_block_args(dim: int, heads: int, mlp_ratio: float) -> None:
+@@ -36,6 +33,33 @@ def _check_block_args(dim: int, heads: int, mlp_ratio: float) -> None:
+         raise ValueError(f"mlp_ratio must be > 0, got {mlp_ratio}")
+ 
+ 
++class DropPath(nn.Module):
++    """Stochastic depth: drop a whole residual branch per sample.
++
++    Training only. The mask has one entry per item of the first axis. A
++    kept branch is divided by the keep probability, so the expected value
++    matches evaluation. ``p = 0`` and eval mode are the identity. No
++    parameters.
++    """
++
++    def __init__(self, p: float = 0.0):
++        super().__init__()
++        if not 0.0 <= p < 1.0:
++            raise ValueError(f"drop path must be in [0, 1), got {p}")
++        self.p = float(p)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        if self.p == 0.0 or not self.training:
++            return x
++        keep = 1.0 - self.p
++        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
++        mask = torch.rand(shape, device=x.device) < keep
++        return x * mask.to(x.dtype) / keep
++
++    def extra_repr(self) -> str:
++        return f"p={self.p}"
++
++
+ class SpectralBlock(nn.Module):
+     """Pre-norm self-attention across the band-group axis.
+ 
+@@ -43,10 +67,13 @@ class SpectralBlock(nn.Module):
+     ``B`` batch, ``N = h * w`` spatial tokens, ``G`` band groups, ``D`` the
+     width (``dim``).
+ 
+-    The body is a TODO. Suggested owner: Tim.
++    The layers are one ``ResidualSelfAttentionBlock``. The forward calls
++    its parts in the same order so stochastic depth can sit on each
++    residual branch. ``drop_path`` adds no parameters; at 0 the output is
++    the same as ``attn_block(x)[0]``.
+     """
+ 
+-    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
++    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0, drop_path: float = 0.0):
+         super().__init__()
+         _check_block_args(dim, heads, mlp_ratio)
+         if mlp_ratio != 4.0:
+@@ -57,25 +84,20 @@ class SpectralBlock(nn.Module):
+         self.heads = heads
+         self.mlp_ratio = mlp_ratio
+         self.attn_block = ResidualSelfAttentionBlock(dim, heads)
++        self.drop_path = DropPath(drop_path)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        """``(B, N, G, D) -> (B, N, G, D)``.
+-
+-        Hint: reshape to ``(B*N, G, D)`` so each spatial token is its own
+-        sequence. Then LayerNorm, attention from ``sw.attention`` across
+-        ``G``, residual, LayerNorm, MLP (hidden width ``dim * mlp_ratio``),
+-        residual, and reshape back to ``(B, N, G, D)``.
+-
+-        ``MultiHeadSelfAttention`` returns ``(output, weights)``. Return the
+-        output tensor only, so the next block can take it.
+-        ``ResidualSelfAttentionBlock`` is that same pre-norm pattern with
+-        the MLP fixed at ``4 * dim``. Any other ``mlp_ratio`` needs
+-        ``FeedForward`` with the hidden width above.
++        """``(B, N, G, D) -> (B, N, G, D)``. The attention weights are dropped.
++
++        Attention runs on ``(B*N, G, D)`` so each spatial token is its own
++        sequence. Each branch is back in ``(B, N, G, D)`` before the drop,
++        so stochastic depth drops a branch per image, not per token.
+         """
+         b, n, g, d = x.shape
+-        x = x.reshape(b * n, g, d)
+-        x, _ = self.attn_block(x)
+-        x = x.reshape(b, n, g, d)
++        blk = self.attn_block
++        attn_out, _ = blk.attn(blk.ln1(x.reshape(b * n, g, d)))
++        x = x + self.drop_path(attn_out.reshape(b, n, g, d))
++        x = x + self.drop_path(blk.ffn(blk.ln2(x)))
+         return x
+ 
+ 
+@@ -103,33 +125,62 @@ class SpectralPool(nn.Module):
+         return x.mean(dim=2) 
+ 
+ class SpatialPE(nn.Module):
+-    """Add a 2D position embedding on an ``h`` by ``w`` token grid.
++    """Add a fixed 2D sin-cos position embedding on an ``h`` by ``w`` grid.
+ 
+     Input ``(B, N, D)`` with ``N = h * w``, plus the grid size. Output
+     ``(B, N, D)``, the same tokens plus the embedding.
+ 
+-    The embedding is a TODO. Suggested owner: Scott. ``sw.pe`` is the
+-    wavelength table already added inside the tokenizer. This one is spatial.
++    No parameters and nothing in the state dict, so one checkpoint runs on
++    a 16 by 16 grid (``--downsample 2``) and a 32 by 32 grid. The first
++    ``ceil(D / 2)`` channels encode the row and the rest the column, each as
++    sin then cos. Positions are grid indices, so a site keeps its code when
++    the grid grows. ``sw.pe`` is the wavelength table inside the tokenizer.
++    This one is spatial.
+     """
+ 
+-    def __init__(self, dim: int):
++    def __init__(self, dim: int, temperature: float = 10000.0):
+         super().__init__()
+-        if dim < 1:
+-            raise ValueError(f"dim must be >= 1, got {dim}")
++        if dim < 2:
++            raise ValueError(f"dim must be >= 2 (one row and one column channel), got {dim}")
++        if temperature <= 0:
++            raise ValueError(f"temperature must be > 0, got {temperature}")
+         self.dim = dim
+-        # TODO(scott): fixed 2D sin-cos (recipe default, 0 parameters) or a learnable table.
++        self.temperature = temperature
+ 
+-    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+-        """``(B, N, D) + pe(h, w) -> (B, N, D)``, where ``N = h * w``.
++    def table(self, h: int, w: int, device=None) -> torch.Tensor:
++        """The ``(h * w, D)`` float32 embedding in row-major order.
+ 
+-        Hint: build an ``(h, w, D)`` embedding, flatten it in row-major
+-        order to ``(N, D)``, and add it to ``x``. Take ``h`` and ``w`` from
+-        the arguments. A 256 input with patch 8 is a 32 by 32 grid (1024
+-        tokens). ``--downsample 2`` makes that 16 by 16 (256 tokens).
++        Row-major is the tokenizer's order: token ``n`` is grid site
++        ``(n // w, n % w)``.
+         """
+-        raise NotImplementedError(
+-            "TODO(scott): SpatialPE. Add a 2D position embedding."
+-        )
++        if h < 1 or w < 1:
++            raise ValueError(f"grid must be at least 1x1, got {h}x{w}")
++        n_freq = -(-self.dim // 4)  # ceil(D / 4) frequencies per axis
++        i = torch.arange(n_freq, device=device, dtype=torch.float32)
++        omega = self.temperature ** (-i / n_freq)  # (n_freq,)
++        ys = torch.arange(h, device=device, dtype=torch.float32)[:, None] * omega
++        xs = torch.arange(w, device=device, dtype=torch.float32)[:, None] * omega
++        row = torch.cat([ys.sin(), ys.cos()], dim=-1)  # (h, 2 * n_freq)
++        col = torch.cat([xs.sin(), xs.cos()], dim=-1)  # (w, 2 * n_freq)
++        n_row = -(-self.dim // 2)  # equals 2 * n_freq when D % 4 == 0
++        n_col = self.dim - n_row
++        grid = torch.cat(
++            [
++                row[:, None, :n_row].expand(h, w, n_row),
++                col[None, :, :n_col].expand(h, w, n_col),
++            ],
++            dim=-1,
++        )  # (h, w, D)
++        return grid.reshape(h * w, self.dim)
++
++    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
++        """``(B, N, D) + pe(h, w) -> (B, N, D)``, where ``N = h * w``."""
++        if x.ndim != 3 or x.shape[1] != h * w or x.shape[2] != self.dim:
++            raise ValueError(
++                f"expected (B, {h * w}, {self.dim}) for a {h}x{w} grid, got {tuple(x.shape)}"
++            )
++        # Built in float32 on the token device, then cast to the token dtype.
++        return x + self.table(h, w, device=x.device).to(x.dtype)
+ 
+ 
+ class SpatialBlock(nn.Module):
+@@ -138,53 +189,76 @@ class SpatialBlock(nn.Module):
+     Input and output are ``(B, N, D)``: ``B`` batch, ``N = h * w`` spatial
+     tokens, ``D`` the width. The group axis is already gone.
+ 
+-    The body is a TODO. Suggested owner: Scott.
++    Same layers and attribute names as
++    ``sw.attention.ResidualSelfAttentionBlock`` (``ln1``, ``attn``, ``ln2``,
++    ``ffn``), so the parameter count equals a ``SpectralBlock`` at
++    ``mlp_ratio`` 4. It is written out for two reasons: the MLP width
++    follows ``mlp_ratio``, and stochastic depth sits on each residual
++    branch. ``drop_path`` adds no parameters.
+     """
+ 
+-    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
++    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0, drop_path: float = 0.0):
+         super().__init__()
+         _check_block_args(dim, heads, mlp_ratio)
++        hidden = int(round(dim * mlp_ratio))
++        if hidden < 1:
++            raise ValueError(f"dim * mlp_ratio must round to >= 1, got {hidden}")
+         self.dim = dim
+         self.heads = heads
+         self.mlp_ratio = mlp_ratio
++        self.ln1 = nn.LayerNorm(dim)
++        self.attn = MultiHeadSelfAttention(dim, heads)
++        self.ln2 = nn.LayerNorm(dim)
++        self.ffn = FeedForward(dim, hidden=hidden)
++        self.drop_path = DropPath(drop_path)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        """``(B, N, D) -> (B, N, D)``.
+-
+-        Hint: LayerNorm, attention from ``sw.attention`` across ``N``,
+-        residual, LayerNorm, MLP (hidden width ``dim * mlp_ratio``),
+-        residual. The tensor is already ``(B, N, D)``, which is the layout
+-        ``MultiHeadSelfAttention`` takes.
+-
+-        Return the output tensor only, not ``(output, weights)``.
+-        ``ResidualSelfAttentionBlock`` matches this pattern when
+-        ``mlp_ratio`` is 4. Any other ratio needs ``FeedForward`` with the
+-        hidden width above.
+-        """
+-        raise NotImplementedError(
+-            "TODO(scott): SpatialBlock. Attention across the N spatial tokens."
+-        )
++        """``(B, N, D) -> (B, N, D)``. The attention weights are dropped."""
++        if x.ndim != 3 or x.shape[-1] != self.dim:
++            raise ValueError(f"expected (B, N, {self.dim}), got {tuple(x.shape)}")
++        attn_out, _ = self.attn(self.ln1(x))
++        x = x + self.drop_path(attn_out)
++        x = x + self.drop_path(self.ffn(self.ln2(x)))
++        return x
+ 
+ 
+ class SegHead(nn.Module):
+     """Map spatial tokens to full-resolution class logits.
+ 
+     Input tokens ``(B, N, D)`` with ``N = h * w``, the grid ``(h, w)``, and
+-    the image size ``out_size = (H, W)``. Output ``(B, num_classes, H, W)``
+-    with ``num_classes`` 7.
+-
+-    ``patch`` is the tokenizer stride (default 8). When ``H`` and ``W`` are
+-    multiples of ``patch``, ``H = h * patch`` and ``W = w * patch``. A crop
+-    that is not a multiple (30 by 40 yields a 3 by 5 grid) still has to
+-    land on ``out_size``.
+-
+-    The body is a TODO. Suggested owner: Scott. The recipe's heavier head
+-    (a 1x1 to 32 channels, two bilinear-times-2 plus 3x3 stages, and an
+-    optional full-resolution spectral skip) can replace a single projection
+-    and upsample later.
++    the image size ``out_size = (H, W)``. Output ``(B, num_classes, H, W)``.
++
++    Steps (the recipe head):
++
++    1. LayerNorm on the tokens (the pre-norm stack ends un-normalised),
++       reshape to ``(B, D, h, w)`` in row-major order, 1x1 conv to
++       ``hidden`` channels.
++    2. Up to two stages of bilinear x2 then a 3x3 conv. The count is
++       ``min(2, floor(log2(patch)))``, so the map never goes below the
++       token grid.
++    3. Bilinear to the pixels the patches cover, ``(h * patch, w * patch)``,
++       then replicate-pad the bottom and right to ``out_size``. The
++       tokenizer drops a remainder there (30 by 40 gives a 3 by 5 grid over
++       24 by 40), so padding keeps each token over its own pixels.
++    4. Optional full-resolution spectral skip: a 1x1 conv on the input cube
++       (``skip_bands`` to ``skip_dim``), concatenated. It is the only path
++       that sees single pixels. ``skip_bands = 0`` builds no skip.
++    5. 1x1 fuse to ``hidden``, ``Dropout2d``, 1x1 classifier.
++
++    GELU follows every conv except the classifier. There is no BatchNorm
++    or GroupNorm, so a pixel's logits do not depend on image statistics.
+     """
+ 
+-    def __init__(self, dim: int, num_classes: int = 7, patch: int = 8):
++    def __init__(
++        self,
++        dim: int,
++        num_classes: int = 7,
++        patch: int = 8,
++        hidden: int = 32,
++        skip_bands: int = 0,
++        skip_dim: int = 16,
++        dropout: float = 0.0,
++    ):
+         super().__init__()
+         if dim < 1:
+             raise ValueError(f"dim must be >= 1, got {dim}")
+@@ -192,9 +266,37 @@ class SegHead(nn.Module):
+             raise ValueError(f"num_classes must be >= 1, got {num_classes}")
+         if patch < 1:
+             raise ValueError(f"patch must be >= 1, got {patch}")
++        if hidden < 1 or skip_dim < 1:
++            raise ValueError(f"hidden and skip_dim must be >= 1, got {hidden}, {skip_dim}")
++        if skip_bands < 0:
++            raise ValueError(f"skip_bands must be >= 0, got {skip_bands}")
++        if not 0.0 <= dropout < 1.0:
++            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+         self.dim = dim
+         self.num_classes = num_classes
+         self.patch = patch
++        self.skip_bands = skip_bands
++
++        self.norm = nn.LayerNorm(dim)
++        self.proj = nn.Sequential(nn.Conv2d(dim, hidden, kernel_size=1), nn.GELU())
++        n_up = 0
++        while n_up < 2 and 2 ** (n_up + 1) <= patch:
++            n_up += 1
++        self.up = nn.ModuleList(
++            [
++                nn.Sequential(nn.Conv2d(hidden, hidden, kernel_size=3, padding=1), nn.GELU())
++                for _ in range(n_up)
++            ]
++        )
++        if skip_bands > 0:
++            self.skip = nn.Sequential(nn.Conv2d(skip_bands, skip_dim, kernel_size=1), nn.GELU())
++            fuse_in = hidden + skip_dim
++        else:
++            self.skip = None
++            fuse_in = hidden
++        self.fuse = nn.Sequential(nn.Conv2d(fuse_in, hidden, kernel_size=1), nn.GELU())
++        self.drop = nn.Dropout2d(dropout)
++        self.classifier = nn.Conv2d(hidden, num_classes, kernel_size=1)
+ 
+     def forward(
+         self,
+@@ -202,24 +304,51 @@ class SegHead(nn.Module):
+         h: int,
+         w: int,
+         out_size: tuple[int, int],
++        image: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         """``(B, N, D) -> (B, num_classes, H, W)``.
+ 
+-        Hint: reshape to ``(B, h, w, D)``, move ``D`` onto the channel axis
+-        so the map is ``(B, D, h, w)``, project channels to ``num_classes``,
+-        and upsample to ``out_size`` ``(H, W)``.
++        ``image`` is the input cube ``(B, skip_bands, H, W)``. A head built
++        with a skip raises without it. A head built without a skip ignores it.
+         """
+-        raise NotImplementedError(
+-            "TODO(scott): SegHead. Map tokens to full-resolution logits."
+-        )
++        b, n, d = tokens.shape
++        if n != h * w or d != self.dim:
++            raise ValueError(
++                f"expected (B, {h * w}, {self.dim}) for a {h}x{w} grid, got {tuple(tokens.shape)}"
++            )
++        height, width = int(out_size[0]), int(out_size[1])
++        y = self.norm(tokens).transpose(1, 2).reshape(b, d, h, w)  # (B, D, h, w)
++        y = self.proj(y)
++        for stage in self.up:
++            y = F.interpolate(y, scale_factor=2, mode="bilinear", align_corners=False)
++            y = stage(y)
++        # The pixels the patches cover. Pad the remainder, do not stretch.
++        cover = (min(h * self.patch, height), min(w * self.patch, width))
++        if tuple(y.shape[-2:]) != cover:
++            y = F.interpolate(y, size=cover, mode="bilinear", align_corners=False)
++        pad_h, pad_w = height - cover[0], width - cover[1]
++        if pad_h or pad_w:
++            y = F.pad(y, (0, pad_w, 0, pad_h), mode="replicate")
++        if self.skip is not None:
++            if image is None:
++                raise ValueError(
++                    "this head was built with a spectral skip; pass image=(B, C, H, W)"
++                )
++            if tuple(image.shape) != (b, self.skip_bands, height, width):
++                raise ValueError(
++                    f"image must be ({b}, {self.skip_bands}, {height}, {width}), "
++                    f"got {tuple(image.shape)}"
++                )
++            y = torch.cat([y, self.skip(image)], dim=1)
++        y = self.fuse(y)
++        return self.classifier(self.drop(y))
+ 
+ 
+ class BandTransformer(nn.Module):
+     """Spectral-then-spatial band-token segmenter.
+ 
+     The forward below is composition. It is already written so the order
+-    is visible. The five modules it calls are TODOs, so a run raises
+-    ``NotImplementedError`` until those bodies exist.
++    is visible.
+ 
+     Args:
+         depth_spectral: number of ``SpectralBlock`` s. ``0`` skips spectral
+@@ -235,6 +364,17 @@ class BandTransformer(nn.Module):
+         group: bands per tokenizer group. Default 16, so ``G = 14``.
+         patch: tokenizer kernel and stride, and the head's nominal scale.
+             Default 8.
++        drop_path: stochastic depth rate of the last block. Rates rise
++            linearly from 0 over all blocks, spectral first then spatial,
++            so a 2 + 6 model and a 0 + 8 model get the same schedule.
++            Default 0 (off).
++        head_skip: build the head with the full-resolution spectral skip
++            (a 1x1 conv on the input cube). Default False.
++        head_dropout: ``Dropout2d`` rate before the classifier. Default 0.
++        tokenizer: ``"band"`` is ``BandTokenizer`` (G band groups).
++            ``"collapsed"`` is ``CollapsedTokenizer`` (all bands mixed to
++            ``group`` channels first, G = 1), the Phase 2 control. Use it
++            with ``depth_spectral=0``.
+ 
+     Input ``(B, n_bands, H, W)`` returns logits ``(B, num_classes, H, W)``.
+     """
+@@ -250,6 +390,10 @@ class BandTransformer(nn.Module):
+         n_bands: int = 224,
+         group: int = 16,
+         patch: int = 8,
++        drop_path: float = 0.0,
++        head_skip: bool = False,
++        head_dropout: float = 0.0,
++        tokenizer: str = "band",
+     ):
+         super().__init__()
+         if depth_spectral < 0 or depth_spatial < 0:
+@@ -272,18 +416,45 @@ class BandTransformer(nn.Module):
+         self.num_classes = num_classes
+         self.patch = patch
+ 
+-        self.tokenizer = BandTokenizer(
+-            n_bands=n_bands, d_model=dim, group=group, patch=patch
+-        )
++        if not 0.0 <= drop_path < 1.0:
++            raise ValueError(f"drop_path must be in [0, 1), got {drop_path}")
++        if tokenizer not in ("band", "collapsed"):
++            raise ValueError(f"tokenizer must be 'band' or 'collapsed', got {tokenizer!r}")
++        self.drop_path = float(drop_path)
++        self.head_skip = bool(head_skip)
++
++        if tokenizer == "band":
++            self.tokenizer = BandTokenizer(
++                n_bands=n_bands, d_model=dim, group=group, patch=patch
++            )
++        else:
++            self.tokenizer = CollapsedTokenizer(
++                n_bands=n_bands, d_model=dim, reduce=group, patch=patch
++            )
++        # One linear schedule over every block, spectral first.
++        depth = depth_spectral + depth_spatial
++        rates = [self.drop_path * i / max(depth - 1, 1) for i in range(depth)]
+         self.spectral = nn.ModuleList(
+-            [SpectralBlock(dim, heads, mlp_ratio) for _ in range(depth_spectral)]
++            [
++                SpectralBlock(dim, heads, mlp_ratio, drop_path=rate)
++                for rate in rates[:depth_spectral]
++            ]
+         )
+         self.pool = SpectralPool(dim)
+         self.pos = SpatialPE(dim)
+         self.spatial = nn.ModuleList(
+-            [SpatialBlock(dim, heads, mlp_ratio) for _ in range(depth_spatial)]
++            [
++                SpatialBlock(dim, heads, mlp_ratio, drop_path=rate)
++                for rate in rates[depth_spectral:]
++            ]
++        )
++        self.head = SegHead(
++            dim,
++            num_classes=num_classes,
++            patch=patch,
++            skip_bands=n_bands if head_skip else 0,
++            dropout=head_dropout,
+         )
+-        self.head = SegHead(dim, num_classes=num_classes, patch=patch)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         """``(B, C, H, W) -> (B, num_classes, H, W)``.
+@@ -300,4 +471,5 @@ class BandTransformer(nn.Module):
+         for block in self.spatial:
+             tokens = block(tokens)  # (B, N, D)
+         height, width = x.shape[-2:]
+-        return self.head(tokens, h, w, out_size=(int(height), int(width)))
++        # image=x feeds the head's optional full-resolution spectral skip.
++        return self.head(tokens, h, w, out_size=(int(height), int(width)), image=x)
+diff --git a/src/sw/train.py b/src/sw/train.py
+index ba674c3..bc4707d 100644
+--- a/src/sw/train.py
++++ b/src/sw/train.py
+@@ -1,10 +1,9 @@
+ """Training harness for SpectralWaste.
+ 
+ ``--model cnn`` (the default) is ``MiniNetSeg``. ``--model transformer``
+-is the band-token scaffold in ``sw.models.transformer``. That forward
+-raises ``NotImplementedError`` until the TODOs in
+-``docs/TRANSFORMER-TODO.md`` are filled in. Leaving ``--model`` unset
+-keeps the CNN path.
++is the band-token model in ``sw.models.transformer``; its flags and run
++order are in ``docs/TRANSFORMER-PLAN.md``. Leaving ``--model`` unset keeps
++the CNN path.
+ 
+ ``train(model, cfg)`` runs AdamW and weighted cross-entropy, reports
+ foreground mIoU on the validation split after every epoch, and writes
+@@ -34,6 +33,7 @@ import csv
+ import json
+ import math
+ import random
++import time
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+ 
+@@ -77,7 +77,14 @@ class TrainConfig:
+ 
+     ``model`` is ``"cnn"`` (``MiniNetSeg``) or ``"transformer"``
+     (``BandTransformer``). The depth, width, head, MLP, patch, and group
+-    fields size the transformer. A CNN run stores them and leaves them unused.
++    fields size the transformer. ``drop_path`` (stochastic depth),
++    ``head_skip`` (full-resolution spectral skip in the head),
++    ``head_dropout`` and ``tokenizer`` (``"band"`` or ``"collapsed"``) are
++    transformer options too, all off by default. A CNN run stores them and
++    leaves them unused.
++
++    ``augment=False`` turns off the training flips and makes the training
++    crop a center crop. It is for the overfit-one-batch check.
+     """
+ 
+     data_root: str | None = None
+@@ -107,6 +114,11 @@ class TrainConfig:
+     mlp_ratio: float = 4.0
+     patch: int = 8
+     group: int = 16
++    drop_path: float = 0.0
++    head_skip: bool = False
++    head_dropout: float = 0.0
++    tokenizer: str = "band"
++    augment: bool = True
+ 
+ 
+ def resolve_device(name: str) -> torch.device:
+@@ -266,7 +278,10 @@ def _evaluate(model, loader, device) -> tuple[float, dict]:
+ def _check_cfg(cfg: TrainConfig) -> None:
+     if cfg.epochs < 1:
+         raise ValueError(f"epochs must be >= 1, got {cfg.epochs}")
+-    if cfg.batch_size < 2:
++    if cfg.batch_size < 1:
++        raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}")
++    # The transformer has no BatchNorm, so a batch of 1 is allowed there.
++    if cfg.model == "cnn" and cfg.batch_size < 2:
+         raise ValueError(
+             f"batch_size must be >= 2 so BatchNorm does not train on a batch of 1, got {cfg.batch_size}"
+         )
+@@ -298,6 +313,17 @@ def _check_cfg(cfg: TrainConfig) -> None:
+             raise ValueError(f"patch must be >= 1, got {cfg.patch}")
+         if cfg.group < 1:
+             raise ValueError(f"group must be >= 1, got {cfg.group}")
++        if not 0.0 <= cfg.drop_path < 1.0:
++            raise ValueError(f"drop_path must be in [0, 1), got {cfg.drop_path}")
++        if not 0.0 <= cfg.head_dropout < 1.0:
++            raise ValueError(f"head_dropout must be in [0, 1), got {cfg.head_dropout}")
++        if cfg.tokenizer not in ("band", "collapsed"):
++            raise ValueError(f"tokenizer must be 'band' or 'collapsed', got {cfg.tokenizer!r}")
++        if cfg.crop_size is not None and cfg.crop_size % cfg.patch != 0:
++            raise ValueError(
++                f"crop_size {cfg.crop_size} must be a multiple of patch {cfg.patch}; "
++                "the tokenizer drops the remainder and the head pads it"
++            )
+ 
+ 
+ def _log_mode(path: Path, resume: bool) -> str:
+@@ -387,13 +413,15 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
+     out_dir = Path(cfg.out_dir)
+     out_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    train_ds = _split(cfg, "train", cfg.max_train_images, train=True)
++    train_ds = _split(cfg, "train", cfg.max_train_images, train=cfg.augment)
+     val_ds = _split(cfg, "val", cfg.max_val_images, train=False)
+-    if len(train_ds) < 2:
++    # Only the CNN has BatchNorm. The transformer may train on one image.
++    needs_two = cfg.model == "cnn"
++    if needs_two and len(train_ds) < 2:
+         raise RuntimeError(
+             "Need at least 2 training images. BatchNorm cannot train on a batch of 1."
+         )
+-    drop_last = _train_drop_last(len(train_ds), cfg.batch_size)
++    drop_last = needs_two and _train_drop_last(len(train_ds), cfg.batch_size)
+     if drop_last:
+         print(
+             "train loader drop_last: leaving out 1 image "
+@@ -438,6 +466,12 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
+         f"train images {len(train_ds)}  val images {len(val_ds)}  "
+         f"downsample {cfg.downsample}  crop {cfg.crop_size}  out {out_dir}"
+     )
++    if cfg.model == "transformer":
++        print(
++            f"transformer  tokenizer {cfg.tokenizer}  blocks {cfg.depth_spectral}+{cfg.depth_spatial}  "
++            f"drop_path {cfg.drop_path}  head_skip {'on' if cfg.head_skip else 'off'}  "
++            f"head_dropout {cfg.head_dropout}  augment {'on' if cfg.augment else 'off'}"
++        )
+     rounded = " ".join(f"{value:.3f}" for value in weights.detach().cpu().tolist())
+     print(f"class weights ({cfg.weight_scheme}): {rounded}")
+     if limited:
+@@ -468,8 +502,10 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
+             loss_sum = 0.0
+             seen = 0
+             steps = 0
++            train_meter = ConfusionMeter()
++            epoch_start = time.perf_counter()
+             for cubes, masks in train_loader:
+-                if cubes.shape[0] < 2:
++                if needs_two and cubes.shape[0] < 2:
+                     raise RuntimeError(
+                         f"training batch has {cubes.shape[0]} image(s); "
+                         "BatchNorm needs at least 2. The train loader should have dropped this tail."
+@@ -478,7 +514,10 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
+                 masks = masks.to(device)
+                 optimizer.zero_grad(set_to_none=True)
+                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+-                    loss = criterion(model(cubes), masks)
++                    logits = model(cubes)
++                    loss = criterion(logits, masks)
++                # Train-mode predictions, taken before this step's update.
++                train_meter.update(logits.detach().float(), masks)
+                 scaler.scale(loss).backward()
+                 scaler.step(optimizer)
+                 scaler.update()
+@@ -490,11 +529,15 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
+             if steps == 0:
+                 raise RuntimeError("no training steps ran; check batch_size and the split size")
+             train_loss = loss_sum / seen
++            train_score = train_meter.fg_miou()
+             score, per_class = _evaluate(model, val_loader, device)
+             epochs_ran = epoch
+             record = {
+                 "epoch": epoch,
+                 "train_loss": train_loss,
++                "train_fg_miou": None if math.isnan(train_score) else train_score,
++                "train_per_class_iou": _iou_payload(train_meter.per_class_iou()),
++                "epoch_seconds": round(time.perf_counter() - epoch_start, 2),
+                 "val_fg_miou": None if math.isnan(score) else score,
+                 "steps": steps,
+                 "per_class_iou": per_class,
+@@ -516,7 +559,7 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
+             current_lr = optimizer.param_groups[0]["lr"]
+             print(
+                 f"epoch {epoch:02d}  steps {steps:4d}  lr {current_lr:.6g}  "
+-                f"train_loss {train_loss:.4f}  val_fg_miou {shown}"
++                f"train_loss {train_loss:.4f}  val_fg_miou {shown}  train_fg_miou {train_score:.4f}"
+             )
+ 
+             improved = math.isfinite(score) and score > best
+@@ -628,9 +671,43 @@ def _build_parser() -> argparse.ArgumentParser:
+         default=16,
+         help="Bands per tokenizer group (transformer). 224 / 16 = 14 groups.",
+     )
++    parser.add_argument(
++        "--drop-path",
++        type=float,
++        default=0.0,
++        help=(
++            "Stochastic depth rate of the last block (transformer). Linear from 0 over all blocks. "
++            "Default 0 (off). The recipe value is 0.1."
++        ),
++    )
++    parser.add_argument(
++        "--head-skip",
++        action="store_true",
++        help="Build the transformer head with the full-resolution spectral skip (1x1 on the cube). Default off.",
++    )
++    parser.add_argument(
++        "--head-dropout",
++        type=float,
++        default=0.0,
++        help="Dropout2d before the classifier (transformer). Default 0 (off). The recipe value is 0.1.",
++    )
++    parser.add_argument(
++        "--tokenizer",
++        choices=["band", "collapsed"],
++        default="band",
++        help=(
++            "band is BandTokenizer (14 groups). collapsed mixes all bands with a 1x1 conv first (G = 1); "
++            "use it with --depth-spectral 0 as the band-collapsed control."
++        ),
++    )
++    parser.add_argument(
++        "--no-aug",
++        action="store_true",
++        help="No training flips and a center crop. For the overfit-one-batch check.",
++    )
+     parser.add_argument("--data-root", default=None, help="Dataset folder. Default: the SW_ROOT environment variable.")
+     parser.add_argument("--epochs", type=int, default=30)
+-    parser.add_argument("--batch-size", type=int, default=4)
++    parser.add_argument("--batch-size", type=int, default=None, help="Default: 4, or 2 with --smoke.")
+     parser.add_argument("--lr", type=float, default=1e-3)
+     parser.add_argument("--weight-decay", type=float, default=1e-4)
+     parser.add_argument("--crop-size", type=int, default=None, help="Square crop after downsampling. Default: full image.")
+@@ -728,7 +805,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
+     return TrainConfig(
+         data_root=args.data_root,
+         epochs=1 if smoke else args.epochs,
+-        batch_size=2 if smoke else args.batch_size,
++        batch_size=args.batch_size if args.batch_size is not None else (2 if smoke else 4),
+         lr=args.lr,
+         weight_decay=args.weight_decay,
+         crop_size=args.crop_size,
+@@ -753,6 +830,11 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
+         mlp_ratio=args.mlp_ratio,
+         patch=args.patch,
+         group=args.group,
++        drop_path=args.drop_path,
++        head_skip=bool(args.head_skip),
++        head_dropout=args.head_dropout,
++        tokenizer=args.tokenizer,
++        augment=not args.no_aug,
+     )
+ 
+ 
+@@ -776,6 +858,10 @@ def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
+             n_bands=in_channels,
+             group=cfg.group,
+             patch=cfg.patch,
++            drop_path=cfg.drop_path,
++            head_skip=cfg.head_skip,
++            head_dropout=cfg.head_dropout,
++            tokenizer=cfg.tokenizer,
+         )
+     raise ValueError(f"model must be 'cnn' or 'transformer', got {cfg.model!r}")
+ 
+diff --git a/tests/test_tokenizer.py b/tests/test_tokenizer.py
+index 8162ed5..b02784d 100644
+--- a/tests/test_tokenizer.py
++++ b/tests/test_tokenizer.py
+@@ -17,3 +17,19 @@ def test_tokenizer_param_count():
+     # conv 65,600 + layernorm 128 + group embedding 14*64 = 896
+     n_params = sum(p.numel() for p in BandTokenizer().parameters())
+     assert n_params == 66_624
++
++
++def test_collapsed_tokenizer_shape_and_params():
++    """The band-collapsed control: one group, same patch conv and LayerNorm."""
++    import torch
++
++    from sw.models.cnn import count_parameters
++    from sw.models.tokenizer import BandTokenizer, CollapsedTokenizer
++
++    tokenizer = CollapsedTokenizer(n_bands=224, d_model=64, reduce=16, patch=8)
++    tokens, (h, w) = tokenizer(torch.rand(2, 224, 30, 40))
++    assert (h, w) == (3, 5)
++    assert tokens.shape == (2, 15, 1, 64)  # (B, N, G = 1, D)
++    assert tokenizer.n_groups == 1
++    assert count_parameters(tokenizer) == 69_328
++    assert count_parameters(tokenizer) - count_parameters(BandTokenizer()) == 2_704
+diff --git a/tests/test_transformer.py b/tests/test_transformer.py
+index 91f4311..6a8cc70 100644
+--- a/tests/test_transformer.py
++++ b/tests/test_transformer.py
+@@ -1,14 +1,9 @@
+-"""Shape contracts for the band-token scaffold.
++"""Contracts for the band-token transformer.
+ 
+-The five bodies raise ``NotImplementedError`` until they are filled in.
+-Those tests are ``xfail`` with ``strict=False``: the suite stays green
+-now, a wrong shape fails once the body exists, and a matching shape is
+-reported as XPASS. ``docs/TRANSFORMER-TODO.md`` says which test to run
+-after each piece.
+-
+-Parameter counts are asserted only for the tokenizer. Pool (mean vs
+-learned token) and spatial PE (sin-cos vs a table) are open choices, and
+-the block bodies are still TODOs, so those counts are not locked.
++Shapes, parameter counts, token order (row-major, the tokenizer's order),
++stochastic depth, the head's optional spectral skip, and the ablation
++rows built from flags. ``docs/TRANSFORMER-PLAN.md`` says which test goes
++with which pull request.
+ """
+ 
+ from __future__ import annotations
+@@ -23,26 +18,17 @@ import torch
+ from PIL import Image
+ 
+ from sw.models.cnn import MiniNetSeg, count_parameters
+-from sw.models.tokenizer import BandTokenizer
++from sw.models.tokenizer import BandTokenizer, CollapsedTokenizer
+ from sw.models.transformer import (
+     BandTransformer,
++    DropPath,
+     SegHead,
+     SpatialBlock,
+     SpatialPE,
+     SpectralBlock,
+     SpectralPool,
+ )
+-from sw.train import _build_parser, build_model, config_from_args, main
+-
+-# A NotImplementedError is the expected failure. Any other exception, including
+-# a wrong shape, fails the run. strict=False keeps an XPASS (body filled, shape
+-# matches) from failing the suite.
+-todo = pytest.mark.xfail(
+-    raises=NotImplementedError,
+-    strict=False,
+-    reason="body is still a TODO; NotImplementedError until it is filled in",
+-)
+-
++from sw.train import TrainConfig, _build_parser, _check_cfg, build_model, config_from_args, main
+ 
+ def test_blocks_reject_heads_that_do_not_divide_dim():
+     with pytest.raises(ValueError, match="divisible"):
+@@ -54,7 +40,7 @@ def test_blocks_reject_heads_that_do_not_divide_dim():
+ 
+ 
+ def test_band_transformer_wiring_and_tokenizer_param_count():
+-    """Tokenizer count is fixed by BandTokenizer. The TODO modules are not."""
++    """Tokenizer count is fixed by BandTokenizer. Module counts are in the tests below."""
+     import sw.models as models
+     import sw.models.transformer as transformer
+ 
+@@ -135,7 +121,6 @@ def test_spectral_pool_shape():
+     assert torch.isfinite(out).all()
+ 
+ 
+-@todo
+ def test_spatial_pe_shape():
+     pe = SpatialPE(dim=64)
+     # Zeros so a real embedding has to be what makes two sites differ.
+@@ -145,18 +130,135 @@ def test_spatial_pe_shape():
+     assert out.shape == (2, h * w, 64)
+     assert torch.isfinite(out).all()
+     assert not torch.allclose(out[0, 0], out[0, 1])
++    assert torch.equal(out[0], out[1])
++    with pytest.raises(ValueError, match="grid"):
++        pe(tokens, 5, 5)
++
++
++def test_spatial_pe_is_fixed_row_major_and_grid_stable():
++    pe = SpatialPE(dim=64)
++    assert count_parameters(pe) == 0
++    assert len(pe.state_dict()) == 0
++
++    # Row-major on a non-square grid: site (i, j) is token i * w + j. The
++    # row half is constant along a row, the column half along a column.
++    h, w = 3, 5
++    grid = pe.table(h, w).reshape(h, w, 64)
++    for i in range(h):
++        for j in range(w):
++            assert torch.equal(grid[i, j, :32], grid[i, 0, :32])
++            assert torch.equal(grid[i, j, 32:], grid[0, j, 32:])
++    assert not torch.allclose(grid[0, 0, :32], grid[1, 0, :32])
++    assert not torch.allclose(grid[0, 0, 32:], grid[0, 1, 32:])
++
++    # A site keeps its code when the grid grows (non-square catches a
++    # column-major flatten; 16 -> 32 is the downsample 2 -> full case).
++    big = pe.table(6, 9).reshape(6, 9, 64)
++    assert torch.equal(big[:3, :5], grid)
++    assert torch.equal(pe.table(32, 32).reshape(32, 32, 64)[:16, :16], pe.table(16, 16).reshape(16, 16, 64))
++
++    # Every site on the full-resolution grid has its own code.
++    full = pe.table(32, 32)
++    assert (torch.cdist(full, full) + torch.eye(1024)).min() > 0.5
++    assert full.abs().max() <= 1.0
++
++    # Widths that are not a multiple of 4 still build. dim 1 has no column channel.
++    for dim in (2, 6, 10, 62):
++        table = SpatialPE(dim).table(7, 9)
++        assert table.shape == (63, dim)
++        assert (torch.cdist(table, table) + torch.eye(63)).min() > 1e-3
++    with pytest.raises(ValueError, match="dim"):
++        SpatialPE(1)
++
++    # The token dtype is kept.
++    assert pe(torch.zeros(1, 15, 64, dtype=torch.float64), 3, 5).dtype == torch.float64
+ 
+ 
+-@todo
+ def test_spatial_block_shape():
+     block = SpatialBlock(dim=64, heads=4, mlp_ratio=4)
+     tokens = torch.randn(2, 16, 64)  # (B, N, D)
+     out = block(tokens)
++    assert isinstance(out, torch.Tensor)
+     assert out.shape == (2, 16, 64)
+     assert torch.isfinite(out).all()
+ 
+ 
+-@todo
++def test_spatial_block_params_ratio_and_gradcheck():
++    spatial = SpatialBlock(dim=64, heads=4, mlp_ratio=4)
++    spectral = SpectralBlock(dim=64, heads=4, mlp_ratio=4)
++    assert count_parameters(spatial) == 49_984
++    assert count_parameters(spectral) == 49_984
++    half = SpatialBlock(dim=64, heads=4, mlp_ratio=2)
++    assert half.ffn.fc1.out_features == 128
++    assert count_parameters(half) == 33_472
++    assert half(torch.randn(1, 4, 64)).shape == (1, 4, 64)
++
++    # Same math as the sw.attention block when the weights are shared.
++    tokens = torch.randn(2, 9, 64)
++    reference = spectral.attn_block
++    spatial.load_state_dict(reference.state_dict(), strict=False)
++    assert torch.allclose(spatial(tokens), reference(tokens)[0], atol=1e-6)
++
++    # Float64 stays exact enough for a numerical gradient check.
++    small = SpatialBlock(dim=8, heads=2, mlp_ratio=2).double()
++    x = torch.randn(1, 3, 8, dtype=torch.float64, requires_grad=True)
++    assert torch.autograd.gradcheck(small, (x,), eps=1e-6, atol=1e-4)
++
++
++def test_drop_path_drops_whole_samples_and_keeps_the_mean():
++    drop = DropPath(0.5)
++    assert count_parameters(drop) == 0
++    x = torch.ones(4000, 3, 2)
++    drop.eval()
++    assert drop(x) is x
++    drop.train()
++    torch.manual_seed(0)
++    out = drop(x)
++    per_sample = out.reshape(4000, -1)
++    dropped = (per_sample == 0).all(dim=1)
++    kept = (per_sample == 2.0).all(dim=1)  # 1 / keep = 2
++    assert (dropped | kept).all()  # a sample is dropped whole or kept whole
++    assert 0.4 < dropped.float().mean() < 0.6
++    assert abs(out.mean().item() - 1.0) < 0.1  # expected value matches eval
++    assert DropPath(0.0).train()(x) is x
++    with pytest.raises(ValueError):
++        DropPath(1.0)
++
++
++def test_blocks_apply_drop_path_per_image():
++    tokens = torch.randn(64, 4, 16)
++    block = SpatialBlock(dim=16, heads=2, drop_path=0.5)
++    block.eval()
++    reference = block(tokens)
++    assert torch.equal(block(tokens), reference)  # eval is deterministic
++    block.train()
++    torch.manual_seed(0)
++    out = block(tokens)
++    same = torch.tensor([torch.allclose(out[i], reference[i], atol=1e-6) for i in range(64)])
++    untouched = torch.tensor([torch.equal(out[i], tokens[i]) for i in range(64)])
++    assert untouched.any()  # both branches dropped: the block is the identity
++    assert not same.all()
++
++    # SpectralBlock: drop_path 0 is the merged block, and a drop is per image.
++    spectral = SpectralBlock(dim=16, heads=2, drop_path=0.0)
++    cube = torch.randn(3, 5, 7, 16)  # (B, N, G, D)
++    expected = spectral.attn_block(cube.reshape(15, 7, 16))[0].reshape(3, 5, 7, 16)
++    assert torch.allclose(spectral(cube), expected, atol=1e-6)
++    spectral = SpectralBlock(dim=16, heads=2, drop_path=0.5).train()
++    torch.manual_seed(0)
++    cube = torch.randn(64, 5, 7, 16)
++    out = spectral(cube)
++    whole = torch.tensor([torch.equal(out[i], cube[i]) for i in range(64)])
++    assert whole.any() and not whole.all()
++    # With the MLP branch silenced, an image's tokens change together or not at all.
++    torch.nn.init.zeros_(spectral.attn_block.ffn.fc2.weight)
++    torch.nn.init.zeros_(spectral.attn_block.ffn.fc2.bias)
++    out = spectral(cube)
++    changed = (out != cube).flatten(2).any(dim=2)  # (B, N)
++    assert (changed.all(dim=1) | ~changed.any(dim=1)).all()
++    assert changed.any() and not changed.all()
++
++
+ def test_seg_head_shape():
+     head = SegHead(dim=64, num_classes=7, patch=8)
+     # 30x40 is not a multiple of patch 8: grid is 3x5, full size stays 30x40.
+@@ -165,9 +267,75 @@ def test_seg_head_shape():
+     logits = head(tokens, h, w, out_size=(30, 40))
+     assert logits.shape == (2, 7, 30, 40)
+     assert torch.isfinite(logits).all()
++    with pytest.raises(ValueError, match="grid"):
++        head(tokens, 5, 5, out_size=(30, 40))
++
++
++def test_seg_head_keeps_each_token_over_its_own_patch():
++    """Row-major order end to end: token n lands on patch (n // w, n % w)."""
++    torch.manual_seed(0)
++    head = SegHead(dim=64, num_classes=7, patch=8).eval()
++    h, w = 3, 5
++    base = head(torch.zeros(1, h * w, 64), h, w, out_size=(24, 40))
++    for n in range(h * w):
++        tokens = torch.zeros(1, h * w, 64)
++        tokens[0, n] = torch.randn(64)
++        change = (head(tokens, h, w, out_size=(24, 40)) - base).abs().sum(dim=1, keepdim=True)
++        per_patch = torch.nn.functional.avg_pool2d(change, 8).reshape(-1)  # (h * w,)
++        assert int(per_patch.argmax()) == n
++
++    # Not a multiple of the patch: the covered rows are unchanged and the
++    # remainder repeats the last covered row. Nothing is stretched.
++    tokens = torch.randn(2, h * w, 64)
++    exact = head(tokens, h, w, out_size=(24, 40))
++    padded = head(tokens, h, w, out_size=(30, 40))
++    assert torch.allclose(padded[:, :, :24], exact, atol=1e-6)
++    for row in range(24, 30):
++        assert torch.allclose(padded[:, :, row], exact[:, :, 23], atol=1e-6)
++
++
++def test_seg_head_uses_every_token_at_any_patch():
++    for patch, grid, size in ((1, 6, 6), (2, 6, 12), (4, 4, 16), (8, 3, 24), (16, 2, 32), (6, 3, 18)):
++        head = SegHead(dim=16, num_classes=7, patch=patch)
++        tokens = torch.randn(1, grid * grid, 16, requires_grad=True)
++        logits = head(tokens, grid, grid, out_size=(size, size))
++        assert logits.shape == (1, 7, size, size)
++        logits.square().sum().backward()
++        assert (tokens.grad.abs().sum(dim=-1) > 0).all()
++
++
++def test_seg_head_skip_flag():
++    plain = SegHead(dim=64, num_classes=7, patch=8)
++    skip = SegHead(dim=64, num_classes=7, patch=8, skip_bands=224)
++    assert plain.skip is None
++    assert count_parameters(plain) == 21_991
++    assert count_parameters(skip) == 26_103
++    h, w = 2, 2
++    tokens = torch.randn(1, h * w, 64)
++    image = torch.rand(1, 224, 16, 16)
++
++    # A head without a skip ignores the cube.
++    assert torch.equal(
++        plain(tokens, h, w, out_size=(16, 16), image=image),
++        plain(tokens, h, w, out_size=(16, 16)),
++    )
++    # A head with a skip never drops it silently.
++    with pytest.raises(ValueError, match="skip"):
++        skip(tokens, h, w, out_size=(16, 16))
++    with pytest.raises(ValueError, match="image must be"):
++        skip(tokens, h, w, out_size=(16, 16), image=image[:, :, :8])
++
++    # The skip is per pixel: one changed spectrum moves one pixel's logits.
++    skip.eval()
++    before = skip(tokens, h, w, out_size=(16, 16), image=image)
++    poked = image.clone()
++    poked[0, :, 5, 9] += 0.5
++    moved = (skip(tokens, h, w, out_size=(16, 16), image=poked) - before).abs().sum(dim=1)[0]
++    assert moved[5, 9] > 0
++    moved[5, 9] = 0
++    assert moved.max() == 0
+ 
+ 
+-@todo
+ def test_band_transformer_shape():
+     model = BandTransformer(
+         depth_spectral=1,
+@@ -182,20 +350,125 @@ def test_band_transformer_shape():
+     assert logits.shape == (2, 7, 30, 40)
+     assert torch.isfinite(logits).all()
+     logits.sum().backward()
++    for name, parameter in model.named_parameters():
++        assert parameter.grad is not None, name
++
++
++def test_band_transformer_param_totals_and_drop_path_schedule():
++    fused = BandTransformer(2, 6)
++    assert count_parameters(fused) == 488_487
++    assert count_parameters(fused.head) == 21_991
++    assert count_parameters(BandTransformer(2, 6, head_skip=True)) == 492_599
++    assert count_parameters(BandTransformer(0, 8)) == 488_487
++
++    collapsed = BandTransformer(0, 8, tokenizer="collapsed")
++    assert isinstance(collapsed.tokenizer, CollapsedTokenizer)
++    assert count_parameters(collapsed.tokenizer) == 69_328
++    assert count_parameters(collapsed) == 491_191  # 2,704 above the fused model
++
++    # One linear schedule over all eight blocks, the same in both arms.
++    def rates(model):
++        return [block.drop_path.p for block in (*model.spectral, *model.spatial)]
++
++    expected = [0.1 * i / 7 for i in range(8)]
++    assert rates(BandTransformer(2, 6, drop_path=0.1)) == pytest.approx(expected)
++    assert rates(BandTransformer(0, 8, drop_path=0.1, tokenizer="collapsed")) == pytest.approx(expected)
++    assert rates(fused) == [0.0] * 8
++    assert rates(BandTransformer(0, 1, drop_path=0.1)) == [0.0]
++    with pytest.raises(ValueError, match="drop_path"):
++        BandTransformer(1, 1, drop_path=1.0)
++    with pytest.raises(ValueError, match="tokenizer"):
++        BandTransformer(1, 1, tokenizer="pca")
++
++
++def test_ablation_rows_build_and_only_the_control_sees_band_order():
++    """Why the control needs its own tokenizer.
++
++    With the band tokenizer, no spectral blocks and no skip, the model is a
++    mean over groups: shuffling the 14 groups changes nothing. That row
++    cannot tell where in the spectrum a dip sits, so it is not the
++    band-collapsed control. The collapsed tokenizer and the fused model both
++    react to the shuffle.
++    """
++    torch.manual_seed(0)
++    images = torch.rand(1, 224, 16, 16)
++    order = torch.randperm(14)
++    shuffled = images.reshape(1, 14, 16, 16, 16)[:, order].reshape(1, 224, 16, 16)
++
++    def change(model):
++        model.eval()
++        with torch.no_grad():
++            return (model(images) - model(shuffled)).abs().max().item()
++
++    assert change(BandTransformer(0, 2)) < 1e-6  # mean-pooled groups: order-blind
++    assert change(BandTransformer(0, 2, tokenizer="collapsed")) > 1e-3
++    # At random init the fused model reacts weakly (about 1e-4 here): band
++    # order reaches it only through the group embedding inside attention.
++    assert change(BandTransformer(1, 1)) > 1e-5
++    assert change(BandTransformer(0, 2, head_skip=True)) > 1e-3  # the skip sees band order
++
++    # Every row of the table runs forward and backward on an odd size.
++    rows = [
++        dict(depth_spectral=2, depth_spatial=6),
++        dict(depth_spectral=2, depth_spatial=6, head_skip=True),
++        dict(depth_spectral=0, depth_spatial=8, tokenizer="collapsed"),
++        dict(depth_spectral=0, depth_spatial=8, tokenizer="collapsed", head_skip=True),
++        dict(depth_spectral=0, depth_spatial=8),
++        dict(depth_spectral=2, depth_spatial=0),
++        dict(depth_spectral=0, depth_spatial=0, head_skip=True),
++    ]
++    for row in rows:
++        model = BandTransformer(drop_path=0.1, head_dropout=0.1, **row)
++        logits = model(torch.rand(2, 224, 30, 40))
++        assert logits.shape == (2, 7, 30, 40)
++        logits.sum().backward()
++
++
++def test_transformer_cli_flags_reach_the_model():
++    cfg = config_from_args(_build_parser().parse_args(["--model", "transformer"]))
++    assert cfg.drop_path == 0.0
++    assert cfg.head_skip is False
++    assert cfg.head_dropout == 0.0
++    assert cfg.tokenizer == "band"
++    assert cfg.augment is True
++    assert count_parameters(build_model(cfg, in_channels=224)) == 488_487
++
++    args = _build_parser().parse_args(
++        [
++            "--model", "transformer", "--depth-spectral", "0", "--depth-spatial", "8",
++            "--tokenizer", "collapsed", "--drop-path", "0.1", "--head-skip",
++            "--head-dropout", "0.1", "--no-aug",
++        ]
++    )
++    cfg = config_from_args(args)
++    model = build_model(cfg, in_channels=224)
++    assert isinstance(model.tokenizer, CollapsedTokenizer)
++    assert model.head.skip is not None
++    assert model.head.drop.p == 0.1
++    assert model.spatial[-1].drop_path.p == pytest.approx(0.1)
++    assert cfg.augment is False
++
++    # No BatchNorm in the transformer, so a batch of 1 is allowed there only.
++    _check_cfg(TrainConfig(model="transformer", batch_size=1))
++    with pytest.raises(ValueError, match="BatchNorm"):
++        _check_cfg(TrainConfig(model="cnn", batch_size=1))
++    with pytest.raises(ValueError, match="multiple of patch"):
++        _check_cfg(TrainConfig(model="transformer", crop_size=30))
++    _check_cfg(TrainConfig(model="transformer", crop_size=32))
+ 
+ 
+ def _synthetic_root(root: Path) -> None:
+-    """Four train cubes and two val cubes. No real SpectralWaste files."""
++    """Four train cubes and two val cubes of random values. No real SpectralWaste files."""
+     shape = (224, 32, 32)
+     _, height, width = shape
++    rng = np.random.default_rng(0)
+     for split, n_images in (("train", 4), ("val", 2)):
+         hyper = root / "hyper" / split
+         labels = root / "labels_hyper_lt" / split
+         hyper.mkdir(parents=True)
+         labels.mkdir(parents=True)
+         for index in range(n_images):
+-            cube = np.zeros(shape, dtype=np.uint16)
+-            cube[0, 0, 0] = 1000 * (index + 1)
++            cube = rng.integers(0, 65535, size=shape, dtype=np.uint16)
+             tifffile.imwrite(hyper / f"{split}_{index:02d}.tiff", cube, photometric="minisblack")
+             mask = np.zeros((height, width), dtype=np.uint8)
+             for cls in range(7):
+@@ -203,31 +476,47 @@ def _synthetic_root(root: Path) -> None:
+             Image.fromarray(mask, mode="L").save(labels / f"{split}_{index:02d}.png")
+ 
+ 
+-@todo
+-def test_transformer_smoke(tmp_path):
+-    """``--model transformer --smoke`` on a tiny synthetic root."""
++@pytest.mark.parametrize(
++    "extra",
++    [
++        [],
++        ["--head-skip", "--drop-path", "0.1", "--head-dropout", "0.1"],
++        ["--tokenizer", "collapsed", "--depth-spectral", "0", "--depth-spatial", "8", "--batch-size", "1"],
++    ],
++)
++def test_transformer_smoke(tmp_path, extra):
++    """``--model transformer --smoke`` on a tiny synthetic root.
++
++    ``--downsample 1`` keeps the 32 by 32 cubes whole, so the grid is 4 by 4
++    and the spatial blocks see 16 tokens. At the smoke default (downsample
++    4) the grid would be 1 by 1 and spatial attention, the position
++    embedding and the head's upsampling would not be exercised.
++    """
+     root = tmp_path / "data"
+     _synthetic_root(root)
+     out = tmp_path / "run"
+-    result = main(
+-        [
+-            "--model",
+-            "transformer",
+-            "--smoke",
+-            "--data-root",
+-            str(root),
+-            "--out-dir",
+-            str(out),
+-            "--device",
+-            "cpu",
+-            "--seed",
+-            "0",
+-        ]
+-    )
++    seen = []
++
++    def record(module, args, output):
++        if isinstance(module, SpatialBlock):
++            seen.append(tuple(args[0].shape))
++
++    handle = torch.nn.modules.module.register_module_forward_hook(record)
++    try:
++        result = main(
++            [
++                "--model", "transformer", "--smoke", "--downsample", "1",
++                "--data-root", str(root), "--out-dir", str(out),
++                "--device", "cpu", "--seed", "0", *extra,
++            ]
++        )
++    finally:
++        handle.remove()
++    assert seen and all(shape[1] == 16 for shape in seen)  # (B, N, D) with N = 4 * 4
+     assert result["epochs_ran"] == 1
+-    # Tokenizer parameters are always present. Blocks only add more.
+     assert result["param_count"] >= 66_624
+     with (out / "metrics.jsonl").open(encoding="utf-8") as handle:
+         rows = [json.loads(line) for line in handle if line.strip()]
+     assert len(rows) == 1
+     assert rows[0]["steps"] == 2
++    assert "train_fg_miou" in rows[0]
