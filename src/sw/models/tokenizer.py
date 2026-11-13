@@ -14,7 +14,11 @@ from sw.pe import IndexBandPE
 
 
 class BandTokenizer(nn.Module):
-    """(B, C, H, W) -> tokens (B*h*w, G, D) and the (h, w) grid size."""
+    """(B, C, H, W) -> tokens (B, h*w, G, D) and the (h, w) grid size.
+
+    Tokens are row-major over the patch grid: token n is patch
+    (n // w, n % w). Pixels past h * patch or w * patch are dropped.
+    """
 
     def __init__(self, n_bands=224, d_model=64, group=16, patch=8):
         super().__init__()

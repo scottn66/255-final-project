@@ -1,6 +1,6 @@
 # Band-token transformer: fill-in order
 
-`src/sw/models/transformer.py` wires the model. Five forwards raise `NotImplementedError`. `BandTransformer.forward` is already written and only calls those pieces. Attention inside the blocks is `src/sw/attention.py` (`nn.Linear` and softmax). Do not call `nn.MultiheadAttention`.
+`src/sw/models/transformer.py` wires the model. `SpectralBlock`, `SpectralPool` (PR #12) and `SpatialPE` are filled in. `SpatialBlock` and `SegHead` still raise `NotImplementedError`. `BandTransformer.forward` is already written and only calls those pieces. Attention inside the blocks is `src/sw/attention.py` (`nn.Linear` and softmax). Do not call `nn.MultiheadAttention`.
 
 The names below are suggestions. `docs/PLAN.md` still has Scott on the critical path. The split is so two people can fill different classes.
 
@@ -31,7 +31,7 @@ pytest -q tests/test_transformer.py::test_spectral_pool_shape
 Add a 2D embedding on the h by w grid. `(B, N, D) -> (B, N, D)` with `N = h * w`. The default written on the class is fixed 2D sin-cos (no parameters). `src/sw/pe.py` is the wavelength table inside the tokenizer, not this grid.
 
 ```bash
-pytest -q tests/test_transformer.py::test_spatial_pe_shape
+pytest -q tests/test_transformer.py -k spatial_pe
 ```
 
 ### 4. SpatialBlock — suggestion: Scott

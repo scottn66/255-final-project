@@ -55,7 +55,7 @@ The old suggested-owner column is retired. Scott holds every package on the crit
 | WP3 | Training + evaluation harness | Loss with class weights, val early stopping, foreground mIoU plus per-class IoU, checkpoint and a results CSV | Scaffold landed Oct 22 (`src/sw/train.py`). A real Colab score is the Oct 26 row. | Done |
 | WP4 | CNN control model | Small CNN (~0.4–0.8M params) trains through WP3 | `MiniNetSeg` is in `src/sw/models/cnn.py`. First val score is still open. | first score 0.391 (half res) |
 | WP5 | Band tokenizer + positional encoding | Groups the 224 bands into tokens; shape checks pass | Positional encoding is in `src/sw/pe.py`. The tokenizer is part of the Nov 1 model. | tokenizer Done (Tim, PR #9; 14 groups x 16 bands, Conv2d 16->64 k8 s8, output (B,1024,14,64), 66,624 params) |
-| WP6 | Transformer blocks + seg head | Our own QKV attention and a decoder that outputs (7, 256, 256) logits | Attention blocks are in `src/sw/attention.py`. The seg head is part of the Nov 1 model. | attention exists, spectral blocks / spatial blocks / seg head open |
+| WP6 | Transformer blocks + seg head | Our own QKV attention and a decoder that outputs (7, 256, 256) logits | Attention blocks are in `src/sw/attention.py`. The seg head is part of the Nov 1 model. | spectral blocks + pool done (Tim, PR #12); spatial PE in review; spatial blocks / seg head open |
 | WP7 | Experiments + results table | Runs the transformer through the harness and fills the table vs 52.8 / 54.3 (58.2 as context) | After the checkup. | not started |
 | WP8 | Checkup deck + writeup | Nov 4 slides: problem, data, model diagram, mean IoU table, failure notes, Phase 2/3 plan | Not started. Surya's optional task is the data slide only. | not started |
 
@@ -64,6 +64,8 @@ The old suggested-owner column is retired. Scott holds every package on the crit
 Jeong said built-in PyTorch transformer pieces are OK, and customization is preferred. A first transformer may start from `nn.TransformerEncoderLayer` so something trains quickly. `torch.nn.functional.scaled_dot_product_attention` is fine inside our own block.
 
 The model we report as ours must use our own band tokenizer (WP5) and the attention block in `src/sw/attention.py`, because the README claims a transformer built from scratch. The built-in `nn.TransformerEncoderLayer` version stays a starting point and a comparison row (built-in vs custom block), which is also an ablation. If that built-in version ends up as the reported model, tell Vision research and change the claim to "trained from scratch with a custom spectral tokenizer" first.
+
+From Nov 12, the WP6 module bodies (spatial position embedding, spatial blocks, seg head) are AI-assisted with Claude Code, then reviewed and run by Scott. Scott made this call because the Dec 2 deadline leaves no time to wait on unassigned work. Each pull request and the final report say so. The slides and report text stay team-written. The plan and the measured prototype are in `docs/TRANSFORMER-PLAN.md` on branch `claude/great-cannon-wdl2oo`.
 
 Lecture tie-ins are a helpful framing for the slides. Band tokens and the wavelength encoding relate to the ViT-components slide in Lecture 1 (patch embedding, position embedding, class token). Segmentation and mIoU relate to Lecture 9 (Oct 21). What was actually said in class, and Jeong's direct guidance, take precedence over the syllabus text.
 

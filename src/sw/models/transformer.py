@@ -4,10 +4,10 @@
 spectral blocks, a pool over band groups, a 2D spatial position
 embedding, spatial blocks, and a segmentation head.
 
-``SpectralBlock``, ``SpectralPool``, ``SpatialPE``, ``SpatialBlock``, and
-``SegHead`` raise ``NotImplementedError``. The steps are in each forward
-docstring. Fill those in; do not rewrite the composition in
-``BandTransformer.forward``.
+Status: ``SpectralBlock`` and ``SpectralPool`` are filled in (PR #12) and
+so is ``SpatialPE``. ``SpatialBlock`` and ``SegHead`` still raise
+``NotImplementedError``; the steps are in each forward docstring. Fill
+those in; do not rewrite the composition in ``BandTransformer.forward``.
 
 Attention inside the blocks has to be ``sw.attention`` (our ``nn.Linear``
 and softmax). Do not call nn.MultiheadAttention or drop in a library ViT
@@ -43,7 +43,7 @@ class SpectralBlock(nn.Module):
     ``B`` batch, ``N = h * w`` spatial tokens, ``G`` band groups, ``D`` the
     width (``dim``).
 
-    The body is a TODO. Suggested owner: Tim.
+    Filled in by Tim (PR #12): it wraps ``sw.attention.ResidualSelfAttentionBlock``.
     """
 
     def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
@@ -103,33 +103,131 @@ class SpectralPool(nn.Module):
         return x.mean(dim=2) 
 
 class SpatialPE(nn.Module):
-    """Add a 2D position embedding on an ``h`` by ``w`` token grid.
+    """Add a fixed 2D sin-cos position embedding on an ``h`` by ``w`` grid.
 
     Input ``(B, N, D)`` with ``N = h * w``, plus the grid size. Output
-    ``(B, N, D)``, the same tokens plus the embedding.
+    ``(B, N, D)``: the same tokens plus one embedding vector per grid site,
+    shared across the batch.
 
-    The embedding is a TODO. Suggested owner: Scott. ``sw.pe`` is the
-    wavelength table already added inside the tokenizer. This one is spatial.
+    Why it is needed: ``SpectralPool`` leaves one token per image patch, and
+    self-attention in ``SpatialBlock`` treats its input as an unordered set.
+    Without this term the spatial blocks cannot tell neighbouring patches
+    from distant ones.
+
+    The formula is the fixed 2D sin-cos table from MAE and later ViT
+    recipes (the original ViT learned its table instead). MAE needs
+    ``D % 4 == 0``; this version also allows ``D % 4 == 2``. ``D`` must be
+    even and at least 4.
+    With ``F = ceil(D / 4)`` frequencies ``omega_k = temperature ** (-k / F)``
+    for ``k = 0 .. F - 1`` (so ``omega_0 = 1``), the code for row ``i`` and
+    column ``j`` is::
+
+        row(i) = [sin(i * omega_0), ..., sin(i * omega_{F-1}),
+                  cos(i * omega_0), ..., cos(i * omega_{F-1})]
+        col(j) = the same with j
+        code(i, j) = row(i)[:D // 2] followed by col(j)[:D // 2]
+
+    When ``D % 4 == 0`` each half is exactly ``2F = D // 2`` values and
+    nothing is cut. When ``D % 4 == 2`` each half keeps all ``F`` sines and
+    the first ``F - 1`` cosines. Either way each axis has sines and cosines.
+
+    At ``D = 64``: 16 frequencies, channels 0-31 encode the row and 32-63
+    encode the column. At ``D = 8``: ``omega = (1, 0.01)``, and site
+    ``(i, j)`` is ``[sin i, sin 0.01i, cos i, cos 0.01i, sin j, sin 0.01j,
+    cos j, cos 0.01j]``. Low ``k`` changes quickly from site to site and
+    high ``k`` slowly. At ``D = 64`` on the 32 by 32 grid, every site's
+    closest codes belong to its 8 grid neighbours, and distance between
+    codes grows roughly (not strictly) with grid distance. At small ``D``
+    the few frequencies repeat sooner (at ``D = 8`` a site 6 columns away
+    can look closer than a neighbour), which is one reason the model uses
+    ``D = 64``.
+
+    Design choices:
+
+    - No parameters and nothing in the state dict. The table is rebuilt
+      on each call (``h * w * D`` values, cheap next to attention), so one
+      checkpoint runs on a 16 by 16 grid (``--downsample 2``) and a 32 by 32
+      grid.
+    - Positions are integer grid indices, not fractions of the image. A
+      site keeps its code when the grid grows: site ``(3, 4)`` has the same
+      code on 16 by 16 and 32 by 32. On the coarser grid each site covers
+      twice the pixels per side (four times the area), so the code means
+      "grid index", not "image location".
+    - Row-major flattening, the tokenizer's order: token ``n`` is grid site
+      ``(n // w, n % w)``.
+
+    ``sw.pe`` is a different table, the wavelength encoding inside the
+    tokenizer. This one is spatial.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, temperature: float = 10000.0):
         super().__init__()
-        if dim < 1:
-            raise ValueError(f"dim must be >= 1, got {dim}")
+        # Even, so the row and column halves are the same size; at least 4,
+        # so each half has a sine and a cosine. Below 4, (sin i, sin j)
+        # alone nearly repeats on a 32 by 32 grid (sin 8 is close to sin 14).
+        if dim < 4 or dim % 2:
+            raise ValueError(f"dim must be even and >= 4, got {dim}")
+        if temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
         self.dim = dim
-        # TODO(scott): fixed 2D sin-cos (recipe default, 0 parameters) or a learnable table.
+        # The longest wavelength scale. 10000 is the ViT and MAE default.
+        self.temperature = temperature
+
+    def table(self, h: int, w: int, device=None, dtype=torch.float32) -> torch.Tensor:
+        """The ``(h * w, D)`` embedding, row-major (see the class docstring).
+
+        ``dtype`` is float32 or float64. Half precision is refused: bf16
+        cannot hold every integer position above 256, and fp16 or bf16
+        angles are too coarse. ``forward`` casts a float32 table instead.
+        """
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError(f"table dtype must be float32 or float64, got {dtype}")
+        if h < 1 or w < 1:
+            raise ValueError(f"grid must be at least 1x1, got {h}x{w}")
+        n_freq = -(-self.dim // 4)  # F = ceil(D / 4) frequencies per axis
+        k = torch.arange(n_freq, device=device, dtype=dtype)
+        omega = self.temperature ** (-k / n_freq)  # (F,): omega_0 = 1, then smaller (1.8e-4 at D = 64)
+        # Angle at each (position, frequency) pair: an outer product.
+        ys = torch.arange(h, device=device, dtype=dtype)[:, None] * omega  # (h, F)
+        xs = torch.arange(w, device=device, dtype=dtype)[:, None] * omega  # (w, F)
+        row = torch.cat([ys.sin(), ys.cos()], dim=-1)  # (h, 2F): all sines, then all cosines
+        col = torch.cat([xs.sin(), xs.cos()], dim=-1)  # (w, 2F)
+        # Split the D channels evenly between the axes. When D % 4 == 0
+        # each half is all 2F values. When D % 4 == 2 the last cosine of
+        # each half is cut (2F = D / 2 + 1).
+        n_row = self.dim // 2
+        n_col = self.dim - n_row
+        # Broadcast so every site (i, j) holds row(i) next to col(j).
+        grid = torch.cat(
+            [
+                row[:, None, :n_row].expand(h, w, n_row),  # constant along a row
+                col[None, :, :n_col].expand(h, w, n_col),  # constant along a column
+            ],
+            dim=-1,
+        )  # (h, w, D)
+        # Row-major flatten: index i * w + j, the order the tokenizer uses.
+        return grid.reshape(h * w, self.dim)
 
     def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
         """``(B, N, D) + pe(h, w) -> (B, N, D)``, where ``N = h * w``.
 
-        Hint: build an ``(h, w, D)`` embedding, flatten it in row-major
-        order to ``(N, D)``, and add it to ``x``. Take ``h`` and ``w`` from
-        the arguments. A 256 input with patch 8 is a 32 by 32 grid (1024
-        tokens). ``--downsample 2`` makes that 16 by 16 (256 tokens).
+        Raises ``ValueError`` if ``x`` is not ``(B, h * w, D)``. That check
+        cannot catch ``h`` and ``w`` passed in swapped order (the product is
+        the same), so take both from the tokenizer, as
+        ``BandTransformer.forward`` does.
         """
-        raise NotImplementedError(
-            "TODO(scott): SpatialPE. Add a 2D position embedding."
-        )
+        if x.ndim != 3 or x.shape[1] != h * w or x.shape[2] != self.dim:
+            raise ValueError(
+                f"expected (B, {h * w}, {self.dim}) for a {h}x{w} grid, got {tuple(x.shape)}"
+            )
+        # Built on the tokens' device. Half-precision tokens get a float32
+        # table cast down: a table built in bf16 is off by up to 0.067 at
+        # D = 64 on 32 by 32, against 0.002 for the cast float32 table. Float64 tokens get a
+        # float64 table, so their values are exact to float64. Broadcasts
+        # over the batch. Out of place, so the caller's tensor is not
+        # modified.
+        table_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        return x + self.table(h, w, device=x.device, dtype=table_dtype).to(x.dtype)
 
 
 class SpatialBlock(nn.Module):
@@ -218,8 +316,8 @@ class BandTransformer(nn.Module):
     """Spectral-then-spatial band-token segmenter.
 
     The forward below is composition. It is already written so the order
-    is visible. The five modules it calls are TODOs, so a run raises
-    ``NotImplementedError`` until those bodies exist.
+    is visible. ``SpatialBlock`` and ``SegHead`` are still TODOs, so a run
+    raises ``NotImplementedError`` until those bodies exist.
 
     Args:
         depth_spectral: number of ``SpectralBlock`` s. ``0`` skips spectral
