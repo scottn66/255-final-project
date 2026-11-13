@@ -1,10 +1,10 @@
 # Band-token transformer: fill-in order
 
-`src/sw/models/transformer.py` wires the model. `SpectralBlock`, `SpectralPool` (PR #12), `SpatialPE` and `SpatialBlock` are filled in. `SegHead` still raises `NotImplementedError`. `BandTransformer.forward` is already written and only calls those pieces. Attention inside the blocks is `src/sw/attention.py` (`nn.Linear` and softmax). Do not call `nn.MultiheadAttention`.
+`src/sw/models/transformer.py` wires the model. Every piece is filled in: `SpectralBlock` and `SpectralPool` (PR #12), then `SpatialPE`, `SpatialBlock` and `SegHead`. `BandTransformer.forward` is already written and only calls those pieces. Attention inside the blocks is `src/sw/attention.py` (`nn.Linear` and softmax). Do not call `nn.MultiheadAttention`.
 
 The names below are suggestions. `docs/PLAN.md` still has Scott on the critical path. The split is so two people can fill different classes.
 
-While a body still raises, its test is an expected failure (`xfail`). A wrong shape is a normal failure as soon as the body exists. A matching shape shows as `XPASS`, and the suite stays green. Delete that test's `pytest.mark.xfail` line once it XPASSes if you want the report to say passed.
+No test is `xfail` any more. Each piece below lists the tests that cover it. The `SpatialPE`, `SpatialBlock` and `SegHead` tests check values against hand-written references; the `SpectralBlock` and `SpectralPool` tests are still shape-only.
 
 Run from the repo root. `pytest.ini` already puts `src` on the path.
 
@@ -47,15 +47,15 @@ pytest -q tests/test_transformer.py -k "spatial_block or drop_path"
 `(B, N, D)` reshaped to `(B, D, h, w)`, then logits upsampled to `(B, 7, H, W)`. `out_size` is the image the tokenizer saw, including sizes that are not a multiple of the patch.
 
 ```bash
-pytest -q tests/test_transformer.py::test_seg_head_shape
+pytest -q tests/test_transformer.py -k seg_head
 ```
 
 ### 6. End-to-end shape
 
-Needs all five. A 30 by 40 input is not a multiple of patch 8, so the logits have to come back as `(2, 7, 30, 40)`.
+Needs all five. A 30 by 40 input is not a multiple of patch 8, so the logits have to come back as `(2, 7, 30, 40)`. The model total is 488,487 parameters, and a 120-step run has to show the model can fit a synthetic task.
 
 ```bash
-pytest -q tests/test_transformer.py::test_band_transformer_shape
+pytest -q tests/test_transformer.py -k band_transformer
 ```
 
 ### 7. Smoke
@@ -67,7 +67,7 @@ pytest -q tests/test_transformer.py::test_transformer_smoke
 PYTHONPATH=src python -m sw.train --model transformer --smoke --device cpu
 ```
 
-The CLI reads `SW_ROOT` (or `--data-root`): a folder with `hyper/` and `labels_hyper_lt/`. `--smoke` is one epoch, batch 2, two optimizer steps, four train images, two val images, downsample 4. The number it prints is a wiring check, not a score. `--model` defaults to `cnn`, and that path is unchanged.
+The CLI reads `SW_ROOT` (or `--data-root`): a folder with `hyper/` and `labels_hyper_lt/`. `--smoke` is one epoch, batch 2, two optimizer steps, four train images, two val images, downsample 4. It prints `BandTransformer parameters: 488,487 (0.488M)`. The val FG mIoU it prints is a wiring check, not a score. `--model` defaults to `cnn`, and that path is unchanged.
 
 ### 8. Colab
 

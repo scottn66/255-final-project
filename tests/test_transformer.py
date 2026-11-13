@@ -1,17 +1,16 @@
 """Contracts for the band-token transformer.
 
-The body that still raises ``NotImplementedError`` (``SegHead``) has
-``xfail`` tests with ``strict=False``: the suite stays green now, a wrong
-shape fails once the body exists, and a matching shape is reported as
-XPASS. ``docs/TRANSFORMER-TODO.md`` says which test to run after each piece.
+Every module is filled in, so nothing is ``xfail`` any more.
+``docs/TRANSFORMER-TODO.md`` says which tests go with which piece.
 
-``SpatialPE`` and ``SpatialBlock`` are tested on values, not only shapes:
-hand-computed sin-cos codes, a functional-only reference for the block,
-the token order against the tokenizer, the calls inside
-``BandTransformer``, and the dtype and device paths. The ``SpectralBlock``
-and ``SpectralPool`` tests are still shape-only. Parameter counts are
-locked for the tokenizer, ``SpatialPE`` (zero, a design choice) and
-``SpatialBlock`` (from the layer formula).
+``SpatialPE``, ``SpatialBlock`` and ``SegHead`` are tested on values, not
+only shapes: hand-computed sin-cos codes, functional-only references for
+the block and the head, the token order against the tokenizer, where each
+token lands in the output, the calls inside ``BandTransformer``, the dtype
+and device paths, and a short training run that has to fit a synthetic
+task. The ``SpectralBlock`` and ``SpectralPool`` tests are still
+shape-only. Parameter counts are locked from the layer formulas, down to
+the model total (488,487).
 """
 
 from __future__ import annotations
@@ -41,14 +40,6 @@ from sw.models.transformer import (
 )
 from sw.train import _build_parser, build_model, config_from_args, main
 
-# A NotImplementedError is the expected failure. Any other exception, including
-# a wrong shape, fails the run. strict=False keeps an XPASS (body filled, shape
-# matches) from failing the suite.
-todo = pytest.mark.xfail(
-    raises=NotImplementedError,
-    strict=False,
-    reason="body is still a TODO; NotImplementedError until it is filled in",
-)
 
 
 def test_blocks_reject_heads_that_do_not_divide_dim():
@@ -558,7 +549,6 @@ def test_band_transformer_runs_the_spatial_blocks_in_order():
         assert count_parameters(block) == count_parameters(SpatialBlock(64, 4, mlp_ratio=2)) == 33_472
 
 
-@todo
 def test_seg_head_shape():
     head = SegHead(dim=64, num_classes=7, patch=8)
     # 30x40 is not a multiple of patch 8: grid is 3x5, full size stays 30x40.
@@ -567,9 +557,179 @@ def test_seg_head_shape():
     logits = head(tokens, h, w, out_size=(30, 40))
     assert logits.shape == (2, 7, 30, 40)
     assert torch.isfinite(logits).all()
+    with pytest.raises(ValueError, match="expected"):
+        head(tokens, 5, 5, out_size=(40, 40))  # 15 tokens are not a 5 by 5 grid
+    with pytest.raises(ValueError, match="expected"):
+        head(torch.randn(2, 15, 32), h, w, out_size=(30, 40))  # wrong width
+    # out_size has to be the image the grid came from.
+    for bad in ((23, 40), (32, 40), (30, 39), (30, 48)):
+        with pytest.raises(ValueError, match="out_size"):
+            head(tokens, h, w, out_size=bad)
+    with pytest.raises(ValueError, match="out_size"):
+        head(tokens, w, h, out_size=(30, 40))  # grid passed as (w, h): 5 * 8 > 30
+    for bad in (dict(hidden=0), dict(dropout=1.0), dict(dropout=-0.1)):
+        with pytest.raises(ValueError):
+            SegHead(dim=64, **bad)
 
 
-@todo
+def _reference_head(head, tokens, h, w, out_size):
+    """The head written with torch.nn.functional only, reading its weights."""
+    b, n, d = tokens.shape
+    y = F.layer_norm(tokens, (d,), head.norm.weight, head.norm.bias, head.norm.eps)
+    y = y.permute(0, 2, 1).reshape(b, d, h, w)
+    conv = head.proj[0]
+    y = F.gelu(F.conv2d(y, conv.weight, conv.bias))
+    for stage in head.up:
+        y = F.interpolate(y, scale_factor=2.0, mode="bilinear", align_corners=False)
+        y = F.gelu(F.conv2d(y, stage[0].weight, stage[0].bias, padding=1))
+    p = head.patch
+    y = F.interpolate(y, size=(h * p, w * p), mode="bilinear", align_corners=False)
+    rows = torch.arange(out_size[0]).clamp(max=h * p - 1)  # replicate padding, by indexing
+    cols = torch.arange(out_size[1]).clamp(max=w * p - 1)
+    y = y[:, :, rows][:, :, :, cols]
+    y = F.gelu(F.conv2d(y, head.fuse[0].weight, head.fuse[0].bias))
+    return F.conv2d(y, head.classifier.weight, head.classifier.bias)
+
+
+def test_seg_head_matches_functional_reference():
+    torch.manual_seed(0)
+    for patch, (h, w), out_size in ((8, (3, 5), (24, 40)), (8, (3, 5), (30, 47)), (4, (4, 2), (19, 9)), (1, (5, 3), (5, 3)), (6, (2, 3), (12, 23))):
+        head = SegHead(dim=16, num_classes=7, patch=patch).double().eval()
+        torch.nn.init.normal_(head.norm.weight, 1.0, 0.3)
+        torch.nn.init.normal_(head.norm.bias, 0.0, 0.3)
+        tokens = torch.randn(2, h * w, 16, dtype=torch.float64)
+        out = head(tokens, h, w, out_size=out_size)
+        expected = _reference_head(head, tokens, h, w, out_size)
+        assert out.shape == expected.shape == (2, 7, *out_size)
+        assert torch.allclose(out, expected, rtol=0, atol=1e-12), (patch, out_size)
+
+
+def test_seg_head_param_count():
+    def expected(d, hidden, classes, n_up):
+        norm = 2 * d
+        proj = d * hidden + hidden  # 1x1 conv
+        up = n_up * (hidden * hidden * 9 + hidden)  # 3x3 convs
+        fuse = hidden * hidden + hidden  # 1x1 conv
+        classifier = hidden * classes + classes  # 1x1 conv
+        return norm + proj + up + fuse + classifier
+
+    assert count_parameters(SegHead(64, 7, 8)) == expected(64, 32, 7, 2) == 21_991
+    for patch, n_up in ((1, 0), (2, 1), (3, 1), (4, 2), (16, 2)):
+        head = SegHead(64, 7, patch)
+        assert len(head.up) == n_up
+        assert count_parameters(head) == expected(64, 32, 7, n_up)
+
+
+def _reach(change, i, j, patch):
+    """How far, in pixels, the changed region extends outside patch (i, j)."""
+    rows, cols = torch.nonzero(change > 0, as_tuple=True)
+    top, left = i * patch, j * patch
+    outside = torch.stack(
+        [top - rows, rows - (top + patch - 1), left - cols, cols - (left + patch - 1), torch.zeros_like(rows)]
+    )
+    return int(outside.max())
+
+
+def test_seg_head_keeps_each_token_over_its_own_patch():
+    """Row-major end to end: token n is centred on patch (n // w, n % w), and
+    its influence reaches only the docstring's measured halo.
+
+    "Most change lands on its own patch" is not a safe test: at random
+    weights the 3x3 convs can put more change on a neighbour. Two properties
+    do hold. (1) With mirror-symmetric 3x3 kernels, the change pattern is
+    symmetric about the token's own patch, so its centroid is the patch
+    centre (exactly, in float64, away from the borders, where the convs'
+    zero padding breaks the symmetry). (2) The reach depends only on the
+    kernel sizes, not the weights: 13 px at patch 8, 15 px with a remainder.
+    """
+    torch.manual_seed(0)
+    for patch in (2, 4, 8, 16):
+        head = SegHead(dim=64, num_classes=7, patch=patch).double().eval()
+        with torch.no_grad():
+            for stage in head.up:
+                kernel = stage[0].weight
+                kernel.copy_((kernel + kernel.flip(-1) + kernel.flip(-2) + kernel.flip(-1, -2)) / 4)
+        h = w = 9
+        size = (h * patch, w * patch)
+        base = head(torch.zeros(1, h * w, 64, dtype=torch.float64), h, w, out_size=size)
+        rows, cols = torch.meshgrid(
+            torch.arange(size[0], dtype=torch.float64), torch.arange(size[1], dtype=torch.float64), indexing="ij"
+        )
+        for i, j in ((4, 4), (3, 5), (5, 3)):  # at least 3 patches from every border
+            tokens = torch.zeros(1, h * w, 64, dtype=torch.float64)
+            tokens[0, i * w + j] = torch.randn(64, dtype=torch.float64)
+            change = (head(tokens, h, w, out_size=size) - base).abs().sum(dim=1)[0]
+            centre = (i * patch + (patch - 1) / 2, j * patch + (patch - 1) / 2)
+            assert abs((change * rows).sum() / change.sum() - centre[0]) < 1e-9, (patch, i, j)
+            assert abs((change * cols).sum() / change.sum() - centre[1]) < 1e-9, (patch, i, j)
+
+    head = SegHead(dim=64, num_classes=7, patch=8).eval()
+    h, w = 6, 7
+    for out_size, bound in (((48, 56), 13), ((55, 63), 15)):  # exact multiple, then a remainder
+        base = head(torch.zeros(1, h * w, 64), h, w, out_size=out_size)
+        reaches = []
+        for n in range(h * w):
+            tokens = torch.zeros(1, h * w, 64)
+            tokens[0, n] = torch.randn(64)
+            change = (head(tokens, h, w, out_size=out_size) - base).abs().sum(dim=1)[0]  # (H, W)
+            reaches.append(_reach(change, *divmod(n, w), patch=8))
+        assert max(reaches) == bound, (out_size, max(reaches))  # the docstring's numbers, exactly
+
+    # Not a multiple of the patch: the covered rows are unchanged and the
+    # remainder repeats the last covered row. Nothing is stretched.
+    h, w = 3, 5
+    tokens = torch.randn(2, h * w, 64)
+    exact = head(tokens, h, w, out_size=(24, 40))
+    padded = head(tokens, h, w, out_size=(30, 47))
+    assert torch.allclose(padded[:, :, :24, :40], exact, atol=1e-6)
+    for row in range(24, 30):
+        assert torch.allclose(padded[:, :, row, :40], exact[:, :, 23], atol=1e-6)
+    for col in range(40, 47):
+        assert torch.allclose(padded[:, :, :24, col], exact[:, :, :, 39], atol=1e-6)
+
+
+def test_seg_head_uses_every_token_at_any_patch():
+    for patch, grid, size in ((1, 6, 6), (2, 6, 12), (4, 4, 16), (8, 3, 24), (16, 2, 32), (6, 3, 18)):
+        head = SegHead(dim=16, num_classes=7, patch=patch)
+        tokens = torch.randn(1, grid * grid, 16, requires_grad=True)
+        logits = head(tokens, grid, grid, out_size=(size, size))
+        assert logits.shape == (1, 7, size, size)
+        logits.square().sum().backward()
+        assert (tokens.grad.abs().sum(dim=-1) > 0).all()
+
+
+def test_seg_head_images_are_independent_and_dropout_is_train_only():
+    torch.manual_seed(0)
+    tokens = torch.randn(4, 15, 64)
+    head = SegHead(dim=64).eval()
+    out = head(tokens, 3, 5, out_size=(24, 40))
+    other = tokens.clone()
+    other[1:] = torch.randn(3, 15, 64)
+    assert torch.equal(head(other, 3, 5, out_size=(24, 40))[0], out[0])  # no batch statistics
+    assert torch.equal(head.train()(tokens, 3, 5, out_size=(24, 40)), out)  # dropout 0: train == eval
+
+    dropped = SegHead(dim=64, dropout=0.5)
+    dropped.load_state_dict(head.state_dict())
+    assert torch.equal(dropped.eval()(tokens, 3, 5, out_size=(24, 40)), out)  # eval: no dropout
+
+    # In training, the classifier's input is the fused map with whole
+    # channels zeroed (Dropout2d) and the rest doubled (1 / keep), which
+    # pins both the dropout type and its place, right before the classifier.
+    seen = []
+    hook = dropped.classifier.register_forward_pre_hook(lambda m, a: seen.append(a[0]))
+    try:
+        dropped.eval()(tokens, 3, 5, out_size=(24, 40))
+        torch.manual_seed(1)
+        dropped.train()(tokens, 3, 5, out_size=(24, 40))
+    finally:
+        hook.remove()
+    clean, noisy = seen
+    zeroed = (noisy == 0).flatten(2).all(dim=2)  # (B, C) whole channel zeroed
+    kept = torch.isclose(noisy, 2 * clean, atol=1e-6).flatten(2).all(dim=2)
+    assert (zeroed | kept).all()
+    assert zeroed.any() and kept.any()
+
+
 def test_band_transformer_shape():
     model = BandTransformer(
         depth_spectral=1,
@@ -583,21 +743,114 @@ def test_band_transformer_shape():
     logits = model(images)
     assert logits.shape == (2, 7, 30, 40)
     assert torch.isfinite(logits).all()
-    logits.sum().backward()
+    logits.square().mean().backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
+
+
+def test_band_transformer_param_total():
+    """488,487 at the defaults, from the parts: tokenizer + blocks + head."""
+    model = BandTransformer(depth_spectral=2, depth_spatial=6)
+    block = 49_984  # SpectralBlock == SpatialBlock at mlp_ratio 4
+    assert count_parameters(model) == 66_624 + 2 * block + 0 + 0 + 6 * block + 21_991 == 488_487
+    assert count_parameters(model.pool) == count_parameters(model.pos) == 0
+    assert count_parameters(model.head) == 21_991
+
+
+def test_band_transformer_head_gets_the_last_tokens_and_image_size():
+    torch.manual_seed(0)
+    model = BandTransformer(depth_spectral=1, depth_spatial=2).eval()
+    seen = {}
+    hooks = [
+        model.spatial[-1].register_forward_hook(lambda m, a, o: seen.update(last=o)),
+        model.head.register_forward_hook(lambda m, a, kw, o: seen.update(args=a, kwargs=kw), with_kwargs=True),
+    ]
+    try:
+        with torch.no_grad():
+            model(torch.rand(1, 224, 30, 47))
+    finally:
+        for hook in hooks:
+            hook.remove()
+    tokens, h, w = seen["args"]
+    assert tokens is seen["last"]
+    assert (h, w) == (3, 5)
+    assert tuple(seen["kwargs"]["out_size"]) == (30, 47)
+
+
+def _learnable_batch(seed, n=4):
+    """Patches whose class is a 16-band spectral shape, repeated in every group.
+
+    The shared group conv sees the shape directly, so a working model fits
+    this quickly. (Telling classes apart by which group is bright is much
+    harder for this design: the conv is shared, so only the group embedding
+    inside spectral attention carries the group's identity. That is a
+    research question for the model, not a wiring test.)
+    """
+    g = torch.Generator().manual_seed(seed)
+    labels = torch.randint(0, 7, (n, 4, 4), generator=g)  # one class per 8 by 8 patch
+    shapes = torch.rand(7, 16, generator=torch.Generator().manual_seed(123))
+    x = 0.05 * torch.rand(n, 224, 32, 32, generator=g)
+    for b in range(n):
+        for i in range(4):
+            for j in range(4):
+                c = int(labels[b, i, j])
+                x[b, :, i * 8 : (i + 1) * 8, j * 8 : (j + 1) * 8] += shapes[c].repeat(14)[:, None, None]
+    return x, labels.repeat_interleave(8, 1).repeat_interleave(8, 2)
+
+
+def _interior(labels):
+    """Pixels whose 3 by 3 neighbourhood has one label (not at a class boundary)."""
+    padded = F.pad(labels[:, None].float(), (1, 1, 1, 1), mode="replicate")[:, 0]
+    same = torch.ones_like(labels, dtype=torch.bool)
+    for di in range(3):
+        for dj in range(3):
+            same &= padded[:, di : di + labels.shape[1], dj : dj + labels.shape[2]] == labels
+    return same
+
+
+def test_band_transformer_learns_a_synthetic_task():
+    """The assembled model can fit a simple task: 120 Adam steps on
+    spectral-shape patches.
+
+    This checks that gradients flow and the model can learn; it is not a
+    wiring test (some wiring bugs still fit this task, and the tests above
+    catch those). Errors sit on class boundaries, which the head blurs by
+    about a pixel, so the bar is interior pixels. Over 40 seeds the worst
+    interior accuracy was 0.993 and the worst loss ratio 0.097.
+    """
+    torch.manual_seed(0)
+    x, y = _learnable_batch(0)
+    model = BandTransformer(depth_spectral=1, depth_spatial=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    losses = []
+    for _ in range(120):
+        loss = F.cross_entropy(model(x), y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    model.eval()
+    with torch.no_grad():
+        pred = model(x).argmax(dim=1)
+    inside = _interior(y)  # about 70% of the pixels
+    interior_accuracy = (pred[inside] == y[inside]).float().mean().item()
+    assert interior_accuracy > 0.98, interior_accuracy  # chance is 1 / 7
+    assert (pred == y).float().mean().item() > 0.90  # boundaries included
+    assert losses[-1] < 0.25 * losses[0]
 
 
 def _synthetic_root(root: Path) -> None:
-    """Four train cubes and two val cubes. No real SpectralWaste files."""
+    """Four train cubes and two val cubes of random values. No real SpectralWaste files."""
     shape = (224, 32, 32)
     _, height, width = shape
+    rng = np.random.default_rng(0)
     for split, n_images in (("train", 4), ("val", 2)):
         hyper = root / "hyper" / split
         labels = root / "labels_hyper_lt" / split
         hyper.mkdir(parents=True)
         labels.mkdir(parents=True)
         for index in range(n_images):
-            cube = np.zeros(shape, dtype=np.uint16)
-            cube[0, 0, 0] = 1000 * (index + 1)
+            cube = rng.integers(0, 65535, size=shape, dtype=np.uint16)
             tifffile.imwrite(hyper / f"{split}_{index:02d}.tiff", cube, photometric="minisblack")
             mask = np.zeros((height, width), dtype=np.uint8)
             for cls in range(7):
@@ -605,30 +858,37 @@ def _synthetic_root(root: Path) -> None:
             Image.fromarray(mask, mode="L").save(labels / f"{split}_{index:02d}.png")
 
 
-@todo
 def test_transformer_smoke(tmp_path):
-    """``--model transformer --smoke`` on a tiny synthetic root."""
+    """``--model transformer --smoke`` on a tiny synthetic root.
+
+    ``--downsample 1`` keeps the 32 by 32 cubes whole, so the grid is 4 by 4
+    and the spatial blocks see 16 tokens. At the smoke default (downsample
+    4) the grid would be 1 by 1, and spatial attention, the position
+    embedding and the head's upsampling would not be exercised.
+    """
     root = tmp_path / "data"
     _synthetic_root(root)
     out = tmp_path / "run"
-    result = main(
-        [
-            "--model",
-            "transformer",
-            "--smoke",
-            "--data-root",
-            str(root),
-            "--out-dir",
-            str(out),
-            "--device",
-            "cpu",
-            "--seed",
-            "0",
-        ]
-    )
+    seen = []
+
+    def record(module, args, output):
+        if isinstance(module, SpatialBlock):
+            seen.append(tuple(args[0].shape))
+
+    handle = torch.nn.modules.module.register_module_forward_hook(record)
+    try:
+        result = main(
+            [
+                "--model", "transformer", "--smoke", "--downsample", "1",
+                "--data-root", str(root), "--out-dir", str(out),
+                "--device", "cpu", "--seed", "0",
+            ]
+        )
+    finally:
+        handle.remove()
+    assert seen and all(shape[1:] == (16, 64) for shape in seen)  # (B, N, D) with N = 4 * 4
     assert result["epochs_ran"] == 1
-    # Tokenizer parameters are always present. Blocks only add more.
-    assert result["param_count"] >= 66_624
+    assert result["param_count"] == 488_487
     with (out / "metrics.jsonl").open(encoding="utf-8") as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
     assert len(rows) == 1

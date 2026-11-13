@@ -4,10 +4,9 @@
 spectral blocks, a pool over band groups, a 2D spatial position
 embedding, spatial blocks, and a segmentation head.
 
-Status: ``SpectralBlock`` and ``SpectralPool`` are filled in (PR #12), and
-so are ``SpatialPE`` and ``SpatialBlock``. ``SegHead`` still raises
-``NotImplementedError``; the steps are in its forward docstring. Fill it
-in; do not rewrite the composition in ``BandTransformer.forward``.
+Status: every module is filled in: ``SpectralBlock`` and ``SpectralPool``
+(PR #12), then ``SpatialPE``, ``SpatialBlock`` and ``SegHead``. Change the
+modules, not the composition in ``BandTransformer.forward``.
 
 Attention inside the blocks has to be ``sw.attention`` (our ``nn.Linear``
 and softmax). Do not call nn.MultiheadAttention or drop in a library ViT
@@ -19,6 +18,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sw.models.tokenizer import BandTokenizer
 from sw.attention import FeedForward, MultiHeadSelfAttention, ResidualSelfAttentionBlock
@@ -345,24 +345,74 @@ class SpatialBlock(nn.Module):
 
 
 class SegHead(nn.Module):
-    """Map spatial tokens to full-resolution class logits.
+    """Map spatial tokens back to full-resolution class logits.
 
     Input tokens ``(B, N, D)`` with ``N = h * w``, the grid ``(h, w)``, and
-    the image size ``out_size = (H, W)``. Output ``(B, num_classes, H, W)``
-    with ``num_classes`` 7.
+    the image size ``out_size = (H, W)``. Output ``(B, num_classes, H, W)``.
+    Each token stands for one ``patch`` by ``patch`` square of the image, so
+    the head has to turn a 32 by 32 grid of 64-wide vectors into a 256 by
+    256 map of 7 logits.
 
-    ``patch`` is the tokenizer stride (default 8). When ``H`` and ``W`` are
-    multiples of ``patch``, ``H = h * patch`` and ``W = w * patch``. A crop
-    that is not a multiple (30 by 40 yields a 3 by 5 grid) still has to
-    land on ``out_size``.
+    Steps (the recipe head), with shapes at full resolution (``h = w = 32``,
+    ``patch = 8``, ``hidden = 32``)::
 
-    The body is a TODO. Suggested owner: Scott. The recipe's heavier head
-    (a 1x1 to 32 channels, two bilinear-times-2 plus 3x3 stages, and an
-    optional full-resolution spectral skip) can replace a single projection
-    and upsample later.
+        LayerNorm, tokens -> (B, D, h, w)        (B, 64, 32, 32)
+        1x1 conv + GELU                          (B, 32, 32, 32)
+        bilinear x2, 3x3 conv + GELU             (B, 32, 64, 64)
+        bilinear x2, 3x3 conv + GELU             (B, 32, 128, 128)
+        bilinear to (h * patch, w * patch)       (B, 32, 256, 256)
+        replicate-pad to out_size                (unchanged here)
+        1x1 conv + GELU, Dropout2d, 1x1 conv     (B, 7, 256, 256)
+
+    Why each step:
+
+    - LayerNorm first: the pre-norm blocks add their branches to an
+      un-normalised residual stream, so the last block's output is not
+      normalised.
+    - The reshape is row-major (token ``n`` is grid site ``(n // w, n % w)``),
+      the tokenizer's order, so each token's map cell sits over its own patch.
+    - Two learned upsampling stages, not one jump: the 3x3 convs let
+      neighbouring tokens shape a smooth boundary between patches. There are
+      ``min(2, floor(log2(patch)))`` of them, so a small patch gets fewer.
+      The last step to full size is plain bilinear. As a result a token
+      also reaches a little past its own patch. Measured at ``patch = 8``:
+      at most 13 pixels when ``H`` and ``W`` are multiples of the patch,
+      and up to ``2 * patch - 1 = 15`` when there is a remainder (the
+      replicate padding extends the last row and column). Never 2 patches.
+    - A limit to know: learned spatial detail stops at stride 2 (the last
+      3x3 conv runs at half resolution) and the final x2 is plain
+      bilinear, so class boundaries come out about a pixel blurred, and
+      1-2 pixel objects (filament, video tape) are hard for this head
+      alone. A full-resolution spectral skip, a separate change, is the
+      per-pixel path.
+    - Pad, never stretch: the tokenizer drops the pixels past the last full
+      patch (a 30 by 40 input gives a 3 by 5 grid over 24 by 40). The map is
+      resized to exactly the covered 24 by 40, and the leftover rows and
+      columns repeat the nearest covered ones. Stretching 24 rows over 30
+      would shift every token off its own pixels.
+    - GELU after every conv except the classifier, as in the blocks. No
+      BatchNorm or GroupNorm, so a pixel's logits never depend on the other
+      images in the batch or on image statistics.
+
+    ``out_size`` must be the image the tokens came from:
+    ``h * patch <= H < (h + 1) * patch``, and the same for ``W``. Anything
+    else raises, which also catches ``h`` and ``w`` passed in swapped order
+    on a non-square image.
+
+    At ``D = 64``, ``hidden = 32``, 7 classes and ``patch = 8``, the head has
+    21,991 parameters (the tests derive this from the layer sizes). The
+    optional full-resolution spectral skip of the recipe is a separate
+    change.
     """
 
-    def __init__(self, dim: int, num_classes: int = 7, patch: int = 8):
+    def __init__(
+        self,
+        dim: int,
+        num_classes: int = 7,
+        patch: int = 8,
+        hidden: int = 32,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         if dim < 1:
             raise ValueError(f"dim must be >= 1, got {dim}")
@@ -370,9 +420,34 @@ class SegHead(nn.Module):
             raise ValueError(f"num_classes must be >= 1, got {num_classes}")
         if patch < 1:
             raise ValueError(f"patch must be >= 1, got {patch}")
+        if hidden < 1:
+            raise ValueError(f"hidden must be >= 1, got {hidden}")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         self.dim = dim
         self.num_classes = num_classes
         self.patch = patch
+        self.hidden = hidden
+
+        self.norm = nn.LayerNorm(dim)
+        self.proj = nn.Sequential(nn.Conv2d(dim, hidden, kernel_size=1), nn.GELU())
+        # Number of learned x2 stages: at most 2, and never more than the
+        # patch allows (2 ** n_up <= patch), so the map is not upsampled past
+        # full resolution. patch 1 -> 0, 2 or 3 -> 1, 4 or more -> 2.
+        n_up = 0
+        while n_up < 2 and 2 ** (n_up + 1) <= patch:
+            n_up += 1
+        self.up = nn.ModuleList(
+            [
+                nn.Sequential(nn.Conv2d(hidden, hidden, kernel_size=3, padding=1), nn.GELU())
+                for _ in range(n_up)
+            ]
+        )
+        self.fuse = nn.Sequential(nn.Conv2d(hidden, hidden, kernel_size=1), nn.GELU())
+        # Dropout2d zeroes whole channels (the same channels at every pixel of
+        # an image) in training. Off by default.
+        self.drop = nn.Dropout2d(dropout)
+        self.classifier = nn.Conv2d(hidden, num_classes, kernel_size=1)
 
     def forward(
         self,
@@ -381,23 +456,43 @@ class SegHead(nn.Module):
         w: int,
         out_size: tuple[int, int],
     ) -> torch.Tensor:
-        """``(B, N, D) -> (B, num_classes, H, W)``.
-
-        Hint: reshape to ``(B, h, w, D)``, move ``D`` onto the channel axis
-        so the map is ``(B, D, h, w)``, project channels to ``num_classes``,
-        and upsample to ``out_size`` ``(H, W)``.
-        """
-        raise NotImplementedError(
-            "TODO(scott): SegHead. Map tokens to full-resolution logits."
-        )
+        """``(B, N, D) -> (B, num_classes, H, W)``; see the class docstring."""
+        if tokens.ndim != 3 or tokens.shape[1] != h * w or tokens.shape[2] != self.dim:
+            raise ValueError(
+                f"expected (B, {h * w}, {self.dim}) for a {h}x{w} grid, got {tuple(tokens.shape)}"
+            )
+        b, _, d = tokens.shape
+        height, width = int(out_size[0]), int(out_size[1])
+        p = self.patch
+        if not (h * p <= height < (h + 1) * p and w * p <= width < (w + 1) * p):
+            raise ValueError(
+                f"out_size {height}x{width} does not match a {h}x{w} grid of {p}-pixel patches "
+                f"(need {h * p}..{(h + 1) * p - 1} by {w * p}..{(w + 1) * p - 1})"
+            )
+        # (B, N, D) -> (B, D, N) -> (B, D, h, w). The transpose matters: a
+        # plain reshape of (B, N, D) would scramble tokens and channels.
+        y = self.norm(tokens).transpose(1, 2).reshape(b, d, h, w)
+        y = self.proj(y)  # (B, hidden, h, w)
+        for stage in self.up:
+            y = F.interpolate(y, scale_factor=2, mode="bilinear", align_corners=False)
+            y = stage(y)
+        # Exactly the pixels the patches cover, then pad the remainder.
+        cover = (h * p, w * p)
+        if tuple(y.shape[-2:]) != cover:
+            y = F.interpolate(y, size=cover, mode="bilinear", align_corners=False)
+        pad_h, pad_w = height - cover[0], width - cover[1]
+        if pad_h or pad_w:
+            # F.pad takes (left, right, top, bottom) for the last two axes.
+            y = F.pad(y, (0, pad_w, 0, pad_h), mode="replicate")
+        y = self.fuse(y)  # (B, hidden, H, W)
+        return self.classifier(self.drop(y))  # (B, num_classes, H, W)
 
 
 class BandTransformer(nn.Module):
     """Spectral-then-spatial band-token segmenter.
 
     The forward below is composition. It is already written so the order
-    is visible. ``SegHead`` is still a TODO, so a run raises
-    ``NotImplementedError`` until that body exists.
+    is visible. Every module it calls is filled in.
 
     Args:
         depth_spectral: number of ``SpectralBlock`` s. ``0`` skips spectral
