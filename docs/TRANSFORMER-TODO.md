@@ -1,6 +1,6 @@
 # Band-token transformer: fill-in order
 
-`src/sw/models/transformer.py` wires the model. `SpectralBlock`, `SpectralPool` (PR #12) and `SpatialPE` are filled in. `SpatialBlock` and `SegHead` still raise `NotImplementedError`. `BandTransformer.forward` is already written and only calls those pieces. Attention inside the blocks is `src/sw/attention.py` (`nn.Linear` and softmax). Do not call `nn.MultiheadAttention`.
+`src/sw/models/transformer.py` wires the model. `SpectralBlock`, `SpectralPool` (PR #12), `SpatialPE` and `SpatialBlock` are filled in. `SegHead` still raises `NotImplementedError`. `BandTransformer.forward` is already written and only calls those pieces. Attention inside the blocks is `src/sw/attention.py` (`nn.Linear` and softmax). Do not call `nn.MultiheadAttention`.
 
 The names below are suggestions. `docs/PLAN.md` still has Scott on the critical path. The split is so two people can fill different classes.
 
@@ -39,7 +39,7 @@ pytest -q tests/test_transformer.py -k spatial_pe
 Pre-norm attention across the N spatial tokens. `(B, N, D) -> (B, N, D)`.
 
 ```bash
-pytest -q tests/test_transformer.py::test_spatial_block_shape
+pytest -q tests/test_transformer.py -k "spatial_block or drop_path"
 ```
 
 ### 5. SegHead — suggestion: Scott

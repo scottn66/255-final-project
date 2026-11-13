@@ -1,17 +1,17 @@
 """Contracts for the band-token transformer.
 
-Bodies that still raise ``NotImplementedError`` (``SpatialBlock`` and
-``SegHead``) have ``xfail`` tests with ``strict=False``: the suite stays
-green now, a wrong shape fails once the body exists, and a matching shape
-is reported as XPASS. ``docs/TRANSFORMER-TODO.md`` says which test to run
-after each piece.
+The body that still raises ``NotImplementedError`` (``SegHead``) has
+``xfail`` tests with ``strict=False``: the suite stays green now, a wrong
+shape fails once the body exists, and a matching shape is reported as
+XPASS. ``docs/TRANSFORMER-TODO.md`` says which test to run after each piece.
 
-``SpatialPE`` is tested on values, not only shapes: hand-computed sin-cos
-codes, the token order against the tokenizer, the call inside
+``SpatialPE`` and ``SpatialBlock`` are tested on values, not only shapes:
+hand-computed sin-cos codes, a functional-only reference for the block,
+the token order against the tokenizer, the calls inside
 ``BandTransformer``, and the dtype and device paths. The ``SpectralBlock``
-and ``SpectralPool`` tests are still shape-only. Parameter counts are locked for
-the tokenizer and for ``SpatialPE`` (zero, a design choice). The others
-are not locked yet.
+and ``SpectralPool`` tests are still shape-only. Parameter counts are
+locked for the tokenizer, ``SpatialPE`` (zero, a design choice) and
+``SpatialBlock`` (from the layer formula).
 """
 
 from __future__ import annotations
@@ -28,8 +28,11 @@ from PIL import Image
 
 from sw.models.cnn import MiniNetSeg, count_parameters
 from sw.models.tokenizer import BandTokenizer
+from sw.attention import ResidualSelfAttentionBlock
+import torch.nn.functional as F
 from sw.models.transformer import (
     BandTransformer,
+    DropPath,
     SegHead,
     SpatialBlock,
     SpatialPE,
@@ -340,13 +343,219 @@ def test_tokenizer_token_order_is_row_major():
             assert int((changed > 1e-6).sum()) == 1  # no other token moved
 
 
-@todo
 def test_spatial_block_shape():
     block = SpatialBlock(dim=64, heads=4, mlp_ratio=4)
     tokens = torch.randn(2, 16, 64)  # (B, N, D)
     out = block(tokens)
+    assert isinstance(out, torch.Tensor)  # tokens only, not (tokens, weights)
     assert out.shape == (2, 16, 64)
     assert torch.isfinite(out).all()
+    with pytest.raises(ValueError, match="expected"):
+        block(torch.randn(2, 16, 32))  # wrong width
+    with pytest.raises(ValueError, match="expected"):
+        block(torch.randn(2, 4, 4, 64))  # still has a group axis
+
+
+def _reference_block(block, x):
+    """Pre-norm attention + MLP written with torch.nn.functional only.
+
+    Independent of sw.attention's code paths: the heads are split by hand,
+    the softmax is F.softmax, and the MLP is F.linear + F.gelu. It reads
+    the block's weights, so any difference is a difference in the math.
+    """
+    b, n, d = x.shape
+    heads = block.heads
+
+    def split(t):  # (B, N, D) -> (B, H, N, D / H)
+        return t.reshape(b, n, heads, d // heads).permute(0, 2, 1, 3)
+
+    a = block.attn
+    y = F.layer_norm(x, (d,), block.ln1.weight, block.ln1.bias, block.ln1.eps)
+    q = split(F.linear(y, a.w_q.weight, a.w_q.bias))
+    k = split(F.linear(y, a.w_k.weight, a.w_k.bias))
+    v = split(F.linear(y, a.w_v.weight, a.w_v.bias))
+    weights = F.softmax(q @ k.transpose(-1, -2) / math.sqrt(d // heads), dim=-1)  # (B, H, N, N)
+    mixed = (weights @ v).permute(0, 2, 1, 3).reshape(b, n, d)
+    x = x + F.linear(mixed, a.w_o.weight, a.w_o.bias)
+    y = F.layer_norm(x, (d,), block.ln2.weight, block.ln2.bias, block.ln2.eps)
+    f = block.ffn
+    return x + F.linear(F.gelu(F.linear(y, f.fc1.weight, f.fc1.bias)), f.fc2.weight, f.fc2.bias)
+
+
+def test_spatial_block_matches_independent_references():
+    """Values, not shapes, in float64 so 1e-12 is meaningful.
+
+    The functional reference is the independent check. The merged
+    ResidualSelfAttentionBlock shares MultiHeadSelfAttention and
+    FeedForward with this block, so agreeing with it shows the composition
+    (pre-norm order, residuals, names) matches, not the attention math.
+    """
+    torch.manual_seed(0)
+    block = SpatialBlock(dim=16, heads=4, mlp_ratio=4).double().eval()
+    # Non-default LayerNorm parameters, so a missing or swapped LayerNorm shows.
+    for norm in (block.ln1, block.ln2):
+        torch.nn.init.normal_(norm.weight, 1.0, 0.3)
+        torch.nn.init.normal_(norm.bias, 0.0, 0.3)
+    x = torch.randn(3, 9, 16, dtype=torch.float64)
+    out = block(x)
+    assert torch.allclose(out, _reference_block(block, x), rtol=0, atol=1e-12)
+
+    # The merged block has the same layers and names, so the weights load
+    # with strict=True and the outputs agree.
+    merged = ResidualSelfAttentionBlock(16, 4).double().eval()
+    merged.load_state_dict(block.state_dict(), strict=True)
+    assert torch.allclose(out, merged(x)[0], rtol=0, atol=1e-12)
+
+
+def test_spatial_block_param_count_follows_mlp_ratio():
+    def expected(d, hidden):
+        layer_norms = 2 * (2 * d)  # two LayerNorms, weight + bias each
+        attention = 4 * (d * d + d)  # Q, K, V, O projections
+        mlp = (d * hidden + hidden) + (hidden * d + d)  # fc1 + fc2
+        return layer_norms + attention + mlp
+
+    for dim, mlp_ratio, hidden in (
+        (64, 4, 256), (64, 2, 128), (64, 1.5, 96),
+        (12, 0.65, 8),  # 7.8 rounds up (floor would give 7)
+        (12, 0.7, 8),  # 8.4 rounds down (ceil would give 9)
+        (12, 0.625, 8),  # 7.5: Python's round goes to the even width
+    ):
+        block = SpatialBlock(dim=dim, heads=4, mlp_ratio=mlp_ratio)
+        assert count_parameters(block) == expected(dim, hidden), (dim, mlp_ratio)
+    with pytest.raises(ValueError, match="round"):
+        SpatialBlock(dim=12, heads=4, mlp_ratio=0.01)  # 0.12 would round to an empty MLP
+    # At mlp_ratio 4 the spatial and spectral blocks are matched (49,984 each).
+    spatial = SpatialBlock(dim=64, heads=4, mlp_ratio=4)
+    assert count_parameters(spatial) == count_parameters(SpectralBlock(dim=64, heads=4, mlp_ratio=4)) == 49_984
+    assert count_parameters(SpatialBlock(dim=64, heads=4, drop_path=0.3)) == 49_984  # drop path is free
+
+
+def test_spatial_block_attends_across_tokens():
+    torch.manual_seed(0)
+    block = SpatialBlock(dim=64, heads=4).eval()
+    tokens = torch.randn(2, 9, 64)
+    out = block(tokens)
+    # No position term inside the block: reordering the tokens reorders the
+    # output and changes nothing else (SpatialPE is what tells sites apart).
+    order = torch.randperm(9)
+    assert torch.allclose(block(tokens[:, order]), out[:, order], atol=1e-5)
+    # Attention mixes tokens: changing token 0 moves the others. (A random
+    # poke, not a constant shift, which the pre-norm would remove.)
+    poked = tokens.clone()
+    poked[:, 0] += torch.randn(64)
+    assert (block(poked)[:, 1:] - out[:, 1:]).abs().max() > 1e-3
+    # Images in a batch do not mix.
+    other = tokens.clone()
+    other[1] = torch.randn(9, 64)
+    assert torch.equal(block(other)[0], out[0])
+
+
+def test_spatial_block_gradcheck():
+    torch.manual_seed(0)
+    block = SpatialBlock(dim=8, heads=2, mlp_ratio=2).double()
+    x = torch.randn(2, 3, 8, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(block, (x,), eps=1e-6, atol=1e-6)
+
+
+def test_drop_path_drops_whole_samples_and_keeps_the_mean():
+    # p = 0.25, not 0.5: at 0.5, dropping with probability "keep" by mistake
+    # would look the same.
+    drop = DropPath(0.25)
+    assert count_parameters(drop) == 0
+    x = torch.ones(4000, 3, 2)
+    drop.eval()
+    assert drop(x) is x  # eval: identity
+    drop.train()
+    torch.manual_seed(0)
+    out = drop(x)
+    per_sample = out.reshape(4000, -1)
+    dropped = (per_sample == 0).all(dim=1)
+    kept = torch.isclose(per_sample, torch.tensor(1 / 0.75)).all(dim=1)  # kept values are divided by keep = 0.75
+    assert (dropped | kept).all()  # each sample is dropped whole or kept whole
+    assert 0.22 < dropped.float().mean() < 0.28  # about p of them (4000 draws, sd 0.007)
+    assert abs(out.mean().item() - 1.0) < 0.05  # expected value matches eval
+    assert DropPath(0.0).train()(x) is x  # p = 0: identity in training too
+    for p in (-0.1, 1.0, 1.5):
+        with pytest.raises(ValueError, match="drop path"):
+            DropPath(p)
+    half = DropPath(0.5).train()(torch.ones(8, 4, dtype=torch.bfloat16))
+    assert half.dtype == torch.bfloat16
+
+    # Any rank: the output keeps the input's shape, each sample is dropped
+    # or kept whole, and the input itself is not modified.
+    for shape in ((400, 4), (400, 3, 2), (400, 2, 3, 5)):
+        x = torch.ones(shape)
+        out = DropPath(0.25).train()(x)
+        assert out.shape == x.shape
+        assert torch.equal(x, torch.ones(shape))  # out of place
+        per_sample = out.reshape(400, -1)
+        assert ((per_sample == 0).all(dim=1) | (per_sample == per_sample[:, :1]).all(dim=1)).all()
+        assert (per_sample == 0).all(dim=1).any() and not (per_sample == 0).all(dim=1).all()
+
+
+def test_spatial_block_drop_path_is_per_image_and_off_in_eval():
+    torch.manual_seed(0)
+    tokens = torch.randn(256, 4, 16)
+    plain = SpatialBlock(dim=16, heads=2, drop_path=0.0)
+    assert torch.equal(plain.train()(tokens), plain.eval()(tokens))  # p = 0: train mode changes nothing
+
+    block = SpatialBlock(dim=16, heads=2, drop_path=0.5)
+    block.eval()
+    reference = block(tokens)
+    assert torch.equal(block(tokens), reference)  # eval is deterministic
+
+    block.train()
+    torch.manual_seed(1)
+    out = block(tokens)
+    attn_out = block.attn(block.ln1(tokens))[0]
+    # Each image ends up in one of four states, one per (attention kept?,
+    # MLP kept?) pair. Check that every image matches one of them exactly.
+    states = []
+    for i in range(256):
+        x = tokens[i : i + 1]
+        a = attn_out[i : i + 1]
+        candidates = []
+        for keep_attn in (0.0, 2.0):  # dropped, or kept and divided by 0.5
+            y = x + keep_attn * a
+            for keep_mlp in (0.0, 2.0):
+                candidates.append(y + keep_mlp * block.ffn(block.ln2(y)))
+        matches = [k for k, c in enumerate(candidates) if torch.allclose(out[i : i + 1], c, atol=1e-5)]
+        assert matches, f"image {i} is not a whole-image drop of either branch"
+        states.append(matches[0])
+    assert set(states) == {0, 1, 2, 3}  # all four combinations occur in 256 images
+
+
+def test_band_transformer_runs_the_spatial_blocks_in_order():
+    """The spatial blocks get the PE'd tokens, in sequence, at full size,
+    and the gradient reaches the tokenizer. The head may still be a TODO."""
+    torch.manual_seed(0)
+    model = BandTransformer(depth_spectral=1, depth_spatial=3).train()
+    seen = []
+    handles = [model.pos.register_forward_hook(lambda m, a, o: seen.append(("pos", o)))]
+    for index, block in enumerate(model.spatial):
+        handles.append(block.register_forward_hook(lambda m, a, o, index=index: seen.append((index, a[0], o))))
+    try:
+        model(torch.rand(1, 224, 256, 256))
+    except NotImplementedError:
+        pass  # SegHead
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert [entry[0] for entry in seen] == ["pos", 0, 1, 2]
+    previous = seen[0][1]
+    for _, inputs, outputs in seen[1:]:
+        assert inputs is previous  # each block reads the previous output
+        assert outputs.shape == (1, 1024, 64)  # 32 by 32 tokens at full resolution
+        assert torch.isfinite(outputs).all()
+        previous = outputs
+    previous.square().mean().backward()
+    assert model.tokenizer.proj.weight.grad.abs().sum() > 0
+
+    # mlp_ratio reaches the spatial blocks. (SpectralBlock still requires 4,
+    # so this uses depth_spectral=0.)
+    narrow = BandTransformer(depth_spectral=0, depth_spatial=2, mlp_ratio=2)
+    for block in narrow.spatial:
+        assert count_parameters(block) == count_parameters(SpatialBlock(64, 4, mlp_ratio=2)) == 33_472
 
 
 @todo

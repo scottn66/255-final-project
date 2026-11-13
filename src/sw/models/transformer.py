@@ -4,10 +4,10 @@
 spectral blocks, a pool over band groups, a 2D spatial position
 embedding, spatial blocks, and a segmentation head.
 
-Status: ``SpectralBlock`` and ``SpectralPool`` are filled in (PR #12) and
-so is ``SpatialPE``. ``SpatialBlock`` and ``SegHead`` still raise
-``NotImplementedError``; the steps are in each forward docstring. Fill
-those in; do not rewrite the composition in ``BandTransformer.forward``.
+Status: ``SpectralBlock`` and ``SpectralPool`` are filled in (PR #12), and
+so are ``SpatialPE`` and ``SpatialBlock``. ``SegHead`` still raises
+``NotImplementedError``; the steps are in its forward docstring. Fill it
+in; do not rewrite the composition in ``BandTransformer.forward``.
 
 Attention inside the blocks has to be ``sw.attention`` (our ``nn.Linear``
 and softmax). Do not call nn.MultiheadAttention or drop in a library ViT
@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from sw.models.tokenizer import BandTokenizer
-from sw.attention import ResidualSelfAttentionBlock
+from sw.attention import FeedForward, MultiHeadSelfAttention, ResidualSelfAttentionBlock
 
 
 def _check_block_args(dim: int, heads: int, mlp_ratio: float) -> None:
@@ -34,6 +34,48 @@ def _check_block_args(dim: int, heads: int, mlp_ratio: float) -> None:
         raise ValueError(f"dim={dim} must be divisible by heads={heads}")
     if mlp_ratio <= 0:
         raise ValueError(f"mlp_ratio must be > 0, got {mlp_ratio}")
+
+
+class DropPath(nn.Module):
+    """Stochastic depth: drop a whole residual branch for some samples.
+
+    In training, each sample in the batch keeps the branch with probability
+    ``1 - p`` and loses it (the branch output becomes zero) with probability
+    ``p``. A kept branch is divided by ``1 - p``, so its expected value
+    equals the branch itself, which is what evaluation uses. In eval mode,
+    and whenever ``p == 0``, this is the identity (the same tensor object
+    is returned). No parameters.
+
+    Used as ``x = x + drop_path(branch(x))``. A dropped branch leaves
+    ``x`` unchanged for that sample, so the block acts as if it were
+    shallower. That regularises deep stacks (Huang et al., 2016; DeiT).
+
+    The mask has one entry per item of the first axis and is shared by
+    every other axis. ``SpatialBlock`` passes ``(B, N, D)``, so a drop
+    there is per image. A caller that folds tokens into the first axis
+    (as ``SpectralBlock`` does with ``(B * N, G, D)``) would drop per token
+    instead, so such a caller must reshape back to ``(B, ...)`` first.
+    ``p`` must be in ``[0, 1)``.
+    """
+
+    def __init__(self, p: float = 0.0):
+        super().__init__()
+        if not 0.0 <= p < 1.0:
+            raise ValueError(f"drop path must be in [0, 1), got {p}")
+        self.p = float(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.p == 0.0 or not self.training:
+            return x
+        keep = 1.0 - self.p
+        # Shape (B, 1, 1, ...): one Bernoulli draw per sample, broadcast
+        # over every other axis.
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = torch.rand(shape, device=x.device) < keep
+        return x * mask.to(x.dtype) / keep
+
+    def extra_repr(self) -> str:
+        return f"p={self.p}"
 
 
 class SpectralBlock(nn.Module):
@@ -231,37 +273,75 @@ class SpatialPE(nn.Module):
 
 
 class SpatialBlock(nn.Module):
-    """Pre-norm self-attention across spatial tokens.
+    """Pre-norm self-attention across the spatial tokens, then an MLP.
 
     Input and output are ``(B, N, D)``: ``B`` batch, ``N = h * w`` spatial
-    tokens, ``D`` the width. The group axis is already gone.
+    tokens (one per image patch, 1024 at full resolution), ``D`` the width.
+    The band-group axis is already gone (``SpectralPool``), and the
+    position embedding is already added (``SpatialPE``).
 
-    The body is a TODO. Suggested owner: Scott.
+    The computation, with ``LN`` a LayerNorm and ``MHSA`` the from-scratch
+    ``sw.attention.MultiHeadSelfAttention``::
+
+        x = x + drop_path(MHSA(LN1(x)))   # each patch reads from all patches
+        x = x + drop_path(MLP(LN2(x)))    # each patch on its own, width D * mlp_ratio
+
+    Pre-norm (normalise before each branch, add the raw residual) is the
+    order ``ResidualSelfAttentionBlock`` and ``SpectralBlock`` use, and it
+    trains more stably from scratch than post-norm (Xiong et al., 2020).
+
+    Why this is written out instead of wrapping
+    ``ResidualSelfAttentionBlock``, as ``SpectralBlock`` does: that block
+    fixes the MLP width at ``4 * D`` and has no place for stochastic depth.
+    The layers and their attribute names (``ln1``, ``attn``, ``ln2``,
+    ``ffn``) are the same, so at ``mlp_ratio`` 4 this block has exactly the
+    parameters of a ``SpectralBlock`` (49,984 at ``D = 64``), and its
+    weights load with ``strict=True`` into a ``ResidualSelfAttentionBlock``
+    (or into a ``SpectralBlock``'s ``attn_block``). ``drop_path`` adds no
+    parameters.
+
+    Cost: attention builds ``(B, heads, N, N)`` tensors, so memory grows
+    with ``N ** 2``. At ``N = 1024``, 4 heads and float32, autograd keeps
+    two of them for the backward pass (the softmax output and the
+    ``nan_to_num`` copy ``sw.attention`` makes of it): 16 MiB each. With the
+    smaller tensors that is about 36 MiB saved per image per block, about
+    1.7 GiB for six blocks at batch 8. Measured on CPU, a forward and
+    backward of those six blocks raises peak memory by about 2 GiB. At
+    ``--downsample 2`` (``N = 256``) the ``N ** 2`` tensors are 16 times
+    smaller.
     """
 
-    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
+    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0, drop_path: float = 0.0):
         super().__init__()
         _check_block_args(dim, heads, mlp_ratio)
+        # MLP hidden width, rounded to the nearest integer (Python's round,
+        # so an exact .5 goes to the even width: 12 * 0.625 = 7.5 gives 8).
+        hidden = int(round(dim * mlp_ratio))
+        if hidden < 1:
+            raise ValueError(f"dim * mlp_ratio must round to >= 1, got {hidden}")
         self.dim = dim
         self.heads = heads
         self.mlp_ratio = mlp_ratio
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = MultiHeadSelfAttention(dim, heads)  # nn.Linear Q, K, V, O and a softmax
+        self.ln2 = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim, hidden=hidden)  # Linear -> GELU -> Linear
+        # One module serves both branches. It holds no state, and each call
+        # draws a fresh mask, so the two branches drop independently.
+        self.drop_path = DropPath(drop_path)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, N, D) -> (B, N, D)``.
 
-        Hint: LayerNorm, attention from ``sw.attention`` across ``N``,
-        residual, LayerNorm, MLP (hidden width ``dim * mlp_ratio``),
-        residual. The tensor is already ``(B, N, D)``, which is the layout
-        ``MultiHeadSelfAttention`` takes.
-
-        Return the output tensor only, not ``(output, weights)``.
-        ``ResidualSelfAttentionBlock`` matches this pattern when
-        ``mlp_ratio`` is 4. Any other ratio needs ``FeedForward`` with the
-        hidden width above.
+        Returns the tokens only. The attention weights that
+        ``MultiHeadSelfAttention`` also returns are discarded here.
         """
-        raise NotImplementedError(
-            "TODO(scott): SpatialBlock. Attention across the N spatial tokens."
-        )
+        if x.ndim != 3 or x.shape[-1] != self.dim:
+            raise ValueError(f"expected (B, N, {self.dim}), got {tuple(x.shape)}")
+        attn_out, _weights = self.attn(self.ln1(x))  # (B, N, D); weights (B, H, N, N) unused
+        x = x + self.drop_path(attn_out)
+        x = x + self.drop_path(self.ffn(self.ln2(x)))
+        return x
 
 
 class SegHead(nn.Module):
@@ -316,8 +396,8 @@ class BandTransformer(nn.Module):
     """Spectral-then-spatial band-token segmenter.
 
     The forward below is composition. It is already written so the order
-    is visible. ``SpatialBlock`` and ``SegHead`` are still TODOs, so a run
-    raises ``NotImplementedError`` until those bodies exist.
+    is visible. ``SegHead`` is still a TODO, so a run raises
+    ``NotImplementedError`` until that body exists.
 
     Args:
         depth_spectral: number of ``SpectralBlock`` s. ``0`` skips spectral
