@@ -14,11 +14,14 @@ Each ``metrics.jsonl`` row also has the training-set FG mIoU and per-class
 IoU of that epoch and its wall time; ``metrics.csv`` keeps its original
 columns so older runs can still be resumed.
 
-The overfit-one-batch check (no augmentation, 4 images; the pass rule is
-in ``docs/COLAB.md``) is::
+The overfit-one-batch check (no augmentation, 4 training cubes that hold
+all six object classes, linked into a small root by
+``sw.gates.build_subset_root``; the pass rule is ``sw.gates.judge_overfit``
+and ``docs/COLAB.md``) is::
 
-    PYTHONPATH=src python -m sw.train --model transformer --downsample 2 --no-aug \
-        --no-cosine --max-train-images 4 --max-val-images 4 --batch-size 4 --epochs 200
+    PYTHONPATH=src python -m sw.train --model transformer --data-root <subset root> \
+        --downsample 2 --no-aug --no-cosine --max-train-images 4 --max-val-images 4 \
+        --batch-size 4 --epochs 600
 
 Run it from the repo root:
 
@@ -41,6 +44,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -360,6 +364,18 @@ def _log_mode(path: Path, resume: bool) -> str:
     return "w"
 
 
+def _atomic_save(payload, path) -> None:
+    """``torch.save`` to a temporary file, then rename it over ``path``.
+
+    A session that dies during the write leaves the previous checkpoint
+    whole, never a truncated one that ``--resume`` cannot load.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
 def _save_last(path, model, optimizer, scheduler, scaler, epoch, best, best_epoch, stall, cfg, weights, use_amp):
     """Resume checkpoint. ``best.pt`` stays the best weights only."""
     payload = {
@@ -376,7 +392,7 @@ def _save_last(path, model, optimizer, scheduler, scaler, epoch, best, best_epoc
     }
     if use_amp:
         payload["scaler"] = scaler.state_dict()
-    torch.save(payload, path)
+    _atomic_save(payload, path)
     print(f"saved {path}  (epoch {epoch})")
 
 
@@ -604,7 +620,7 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 best = score
                 best_epoch = epoch
                 stall = 0
-                torch.save(
+                _atomic_save(
                     {
                         "model": model.state_dict(),
                         "epoch": epoch,

@@ -597,3 +597,23 @@ def test_overfit_gate_runs_through_the_cli(tmp_path):
     assert rows[-1]["train_fg_miou"] > 0.85
     assert rows[-1]["train_fg_miou"] - rows[0]["train_fg_miou"] > 0.5
     assert set(rows[-1]["train_per_class_iou"]) == set(rows[-1]["per_class_iou"])
+
+
+def test_checkpoint_save_is_atomic(tmp_path, monkeypatch):
+    import sw.train as train_mod
+
+    path = tmp_path / "last.pt"
+    train_mod._atomic_save({"epoch": 1}, path)
+    assert torch.load(path, weights_only=False) == {"epoch": 1}
+    assert not (tmp_path / "last.pt.tmp").exists()
+
+    def dies_mid_write(payload, target):
+        with open(target, "wb") as handle:
+            handle.write(b"half a checkpoint")
+        raise OSError("session died")
+
+    monkeypatch.setattr(train_mod.torch, "save", dies_mid_write)
+    with pytest.raises(OSError):
+        train_mod._atomic_save({"epoch": 2}, path)
+    monkeypatch.undo()
+    assert torch.load(path, weights_only=False) == {"epoch": 1}  # the previous checkpoint is whole

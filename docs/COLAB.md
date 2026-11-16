@@ -42,7 +42,15 @@ The learning rate follows cosine annealing over `--epochs`. `--no-cosine` keeps 
 
 ## Transformer: first runs, in order
 
-Until the WP6 pull requests are merged, clone their branch instead of `main` once it is pushed: `git clone -b wp6-harness-gates https://github.com/scottn66/255-final-project.git`. Train in full precision first (no `--amp`).
+`notebooks/06_transformer_gates.ipynb` runs everything in this section in order with Runtime → Run all: setup, data, smoke, memory, overfit, and the half-resolution screening runs. It stops at the first failed gate.
+
+Run all asks once for the Drive sign-in. Keep its monitor cell running: an idle notebook can be recycled. After a disconnect, Run all again:
+- Gates 1 and 2 are skipped once `gates.json` on Drive records them for the commit.
+- Screening runs resume from `last.pt`.
+
+The steps below are the same gates by hand.
+
+Until the WP6 pull requests are merged, clone their branch instead of `main`: `git clone -b wp6-colab-gates https://github.com/scottn66/255-final-project.git`. Train in full precision first (no `--amp`).
 
 1. Smoke. It must print `BandTransformer parameters: 488,487 (0.488M)`.
 
@@ -69,18 +77,30 @@ print("seconds per step (upper bound)", row["train_seconds"] / 25)
 
 `train_seconds` includes the data loader's start-up and the first batches' reads, so with few steps it overstates the per-step time; 25 steps keeps that small. A full epoch at batch 8 is 65 steps (514 training images) plus validation. "Reserved" is what the allocator holds and is closer to what `nvidia-smi` shows; the CUDA context adds a few hundred MB on top.
 
-3. Overfit one batch: no augmentation, 4 images, a constant learning rate. No 30-epoch run before this passes. Read `train_per_class_iou` in the last row of `metrics.jsonl`:
+3. Overfit four training cubes: no augmentation, a constant learning rate, half resolution, one optimizer step per epoch. No 30-epoch run before this passes.
 
-   - **Pass (the head as it is now, without the spectral skip):** film, basket, cardboard and bag are each above 0.9. Filament and video tape are reported but not judged: they are 1 to 2 pixels wide and the head blurs boundaries by about a pixel, so they can stay low without anything being wrong.
-   - **Pass (once the head has the spectral skip):** `train_fg_miou` above 0.95, all six object classes included.
-   - **Still rising at epoch 200:** run 400 epochs before calling it a failure.
-   - **Fail:** the loss is flat, or the four large classes stay under 0.9 at 400 epochs. Check labels, token order and the loss first.
+   The four cubes are `sw.gates.OVERFIT_STEMS`; together they hold all six object classes. Link them into a small `SW_ROOT` first. `--max-train-images 4` alone takes the first four training images, which hold only background, film and bag, so basket and cardboard could not be judged.
+
+```python
+import sys; sys.path.insert(0, "src")
+from sw import gates
+gates.build_subset_root("/content/data/spectralwaste_segmentation", "/content/sw_overfit_root")
+```
 
 ```bash
-PYTHONPATH=src python -m sw.train --model transformer --downsample 2 --no-aug --no-cosine \
-  --max-train-images 4 --max-val-images 4 --batch-size 4 --epochs 200 --num-workers 2 \
-  --device cuda --out-dir /content/drive/MyDrive/sw_runs/tf_overfit
+PYTHONPATH=src python -m sw.train --model transformer --data-root /content/sw_overfit_root --downsample 2 \
+  --no-aug --no-cosine --max-train-images 4 --max-val-images 4 --batch-size 4 --epochs 600 --num-workers 0 \
+  --device cuda --out-dir /content/sw_gates/tf_overfit
 ```
+
+   Judge it with `gates.judge_overfit(gates.read_metrics("/content/sw_gates/tf_overfit/metrics.jsonl"), pixels=gates.class_pixels("/content/sw_overfit_root"))`:
+
+   - **Pass (the head as it is now, without the spectral skip):** within 600 epochs, at least one epoch has film, basket, cardboard and bag *all* above 0.9 training IoU. The first such epoch counts, so a later loss spike does not hide a pass. Filament and video tape are reported but not judged: they are 1 to 2 pixels wide and the head blurs boundaries by about a pixel, so they can stay low without anything being wrong.
+   - **Pass (once the head has the spectral skip):** `train_fg_miou` above 0.95, all six object classes included.
+   - **Still rising at epoch 600:** resume to 900 (`--resume /content/sw_gates/tf_overfit/last.pt --epochs 900`) before calling it a failure.
+   - **Fail:** the loss is flat, or no epoch has all four large classes above 0.9. Run the CNN (`--model cnn`) on the same cubes and flags. If the CNN fits, look at the transformer (token order, tokenizer input scale, the head). If it does not fit either, look at the labels, the class weights and the loss.
+
+   Why 600 epochs: measured on real cubes on Nov 16, on Apple MPS (so not a Colab number). The transformer first passed at epochs 337, 447 and 433 (seeds 0, 1, 2); MiniNetSeg (one seed) passed at epoch 43. Training FG mIoU stayed under 0.1 for the first 94 to 131 epochs, while the model predicted almost only background; that is expected. Learning rates 3e-4 and 3e-3 were both slower than 1e-3. One seed's loss spiked around epoch 550 (0.10 to 1.13) at the constant learning rate, then recovered. That spike is a reason to land gradient clipping and warmup (the optimiser-recipe PR) before the long runs. The earlier rule (above 0.9 at 200 or 400 epochs on the first four images) came from synthetic data. On the real images it could judge only two classes, and whether it passed depended on the seed.
 
 Each `metrics.jsonl` row has `train_fg_miou` and `train_per_class_iou` (from the predictions the training steps already make: train mode, before each step's update, so they lag a little), `train_seconds` (the training pass) and `epoch_seconds` (training plus validation). `metrics.csv` keeps its original columns. The transformer may use `--batch-size 1`; the CNN needs 2 or more (BatchNorm). A transformer `--crop-size` must be a multiple of the patch (8).
 
