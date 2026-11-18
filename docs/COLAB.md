@@ -40,6 +40,28 @@ PYTHONPATH=src python -m sw.train --epochs 30 --batch-size 4 --num-workers 2 --d
 
 The learning rate follows cosine annealing over `--epochs`. `--no-cosine` keeps it constant. `--amp` turns on mixed precision (`torch.autocast` and `GradScaler`) on CUDA only.
 
+## Optimiser recipe
+
+Three flags, all off by default, so a command without them trains exactly as before:
+
+- `--warmup-steps W` (default 0): linear warmup. Optimizer step k, counted from 1 over the whole run, uses the scheduled rate times `min(1, k / W)`. W is in optimizer steps, not epochs: at batch 4 an epoch of the full training split is 129 steps. With cosine on, the two multiply: cosine sets the rate once per epoch, warmup scales it per step. The step count is in `last.pt`, so a resumed run continues the ramp.
+- `--clip-grad-norm C` (default: no clipping): `torch.nn.utils.clip_grad_norm_` on all model parameters before each optimizer step (after `scaler.unscale_` under `--amp`). Each `metrics.jsonl` row then has `grad_norm_max`, the largest norm of that epoch before clipping.
+- `--cosine-floor F` (default 0): with cosine on, the rate anneals from `--lr` down to `--lr` times F, not to 0. It bounds the cosine schedule, not the warmup ramp. With `--no-cosine` it is ignored and a line says so.
+
+Measured on Nov 18 on the four overfit cubes of Gate 2 (Apple MPS, the Gate 2 flags, 800 epochs of one step, seeds 0, 1, 2), without the flags and with `--clip-grad-norm 1.0 --warmup-steps 20`. A wiring check on four training images, not a result.
+
+| seed | first epoch with all four large classes above 0.9: no flags / recipe | largest one-epoch loss increase: no flags / recipe |
+| --- | --- | --- |
+| 0 | 337 / 382 | +6.64 at epoch 762 (0.52 to 7.16) / +0.14 at epoch 160 |
+| 1 | 447 / 378 | +0.37 at epoch 115 / +0.18 at epoch 119 |
+| 2 | 433 / 442 | +0.24 at epoch 155 / +0.46 at epoch 137 |
+
+- Without the flags, seed 0 fell apart at epoch 760 (loss 0.07 to 7.16 in three epochs) and had not recovered by epoch 800 (training FG mIoU 0.04). Continuing that same run from its epoch-755 checkpoint with `--clip-grad-norm 1.0` gave no spike (loss at most 0.076 through epoch 800); continuing it without the flag gave the same collapse again.
+- The recipe did not make the fit faster or slower in any one direction: later for seeds 0 and 2, earlier for seed 1. All six runs pass Gate 2 within 600 epochs.
+- Clipping does not remove the loss jumps of 0.1 to 0.5 in epochs 100 to 200, while the model leaves the all-background stage. After the first passing epoch, no recipe run rose by more than 0.04 in one epoch.
+
+A run that `sw.gates` started without these flags resumes as before. Adding one to a run already started is a different run: `sw.gates` refuses it, so use a new folder.
+
 ## Transformer: first runs, in order
 
 `notebooks/06_transformer_gates.ipynb` runs everything in this section in order with Runtime → Run all: setup, data, smoke, memory, overfit, and the half-resolution screening runs. It stops at the first failed gate.
