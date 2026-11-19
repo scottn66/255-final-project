@@ -106,7 +106,7 @@ the `1e-3` arms.
 Or clone by hand:
 
 ```bash
-git clone -b cursor/colab-input-blind-ab-2779 \
+git clone -b wp6-colab-gates \
   https://github.com/scottn66/255-final-project.git
 cd 255-final-project
 pip install -q -r requirements.txt
