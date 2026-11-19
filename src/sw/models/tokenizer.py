@@ -20,16 +20,17 @@ class BandTokenizer(nn.Module):
     (n // w, n % w). Pixels past h * patch or w * patch are dropped.
     """
 
-    def __init__(self, n_bands=224, d_model=64, group=16, patch=8):
+    def __init__(self, n_bands=224, d_model=64, group=16, patch=8, pe_init_std=1.0):
         super().__init__()
         if n_bands % group != 0:
             raise ValueError(f"n_bands {n_bands} must be divisible by group {group}")
         self.n_bands = n_bands
         self.group = group
         self.n_groups = n_bands // group
+        self.pe_init_std = float(pe_init_std)
         self.proj = nn.Conv2d(group, d_model, kernel_size=patch, stride=patch)
         self.norm = nn.LayerNorm(d_model)
-        self.group_emb = IndexBandPE(self.n_groups, d_model)  
+        self.group_emb = IndexBandPE(self.n_groups, d_model, init_std=pe_init_std)  
 
     def forward(self, x):
         b, c, h_in, w_in = x.shape

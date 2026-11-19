@@ -53,12 +53,18 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
-from sw.data import CLASS_NAMES, SpectralWasteDataset, class_weights
+from sw.data import (
+    CLASS_NAMES,
+    HYPER_LT_TRAIN_PIXEL_COUNTS,
+    SpectralWasteDataset,
+    class_weights,
+)
 from sw.metrics import NUM_CLASSES, ConfusionMeter, fg_miou_from_cm
 from sw.models.cnn import MiniNetSeg, count_parameters
-from sw.models.transformer import BandTransformer
+from sw.models.transformer import BandTransformer, init_seg_head_prior_bias
+from sw.standardize import BandStandardizer, load_or_compute_band_stats
 
 
 @dataclass
@@ -96,6 +102,20 @@ class TrainConfig:
     a center crop, so every epoch sees exactly the same pixels. It is for
     the overfit-one-batch check.
 
+    ``standardize`` applies per-band mean/std from the TRAIN split only
+    (cached at ``stats_path``, default ``{out_dir}/band_stats.pt``). Val and
+    test use the same affine. See ``docs/INPUT-BLIND.md``.
+
+    ``pe_init_std`` scales ``IndexBandPE`` after its default ``N(0, 1)`` draw
+    (transformer only). ``1.0`` leaves today's initialisation alone.
+
+    ``head_prior_bias`` sets the SegHead final conv bias to ``log`` train
+    class priors (transformer only; default off).
+
+    Default ``lr`` stays ``1e-3`` for both models. For the transformer on
+    raw (non-standardised) cubes, ``3e-4`` is the recommended starting
+    point; see ``docs/INPUT-BLIND.md``.
+
     Batch size: the CNN has BatchNorm, so it needs at least 2 images per
     training batch. The transformer has no batch statistics and may train
     on batches of 1. A transformer ``crop_size`` must be a multiple of
@@ -130,6 +150,10 @@ class TrainConfig:
     patch: int = 8
     group: int = 16
     augment: bool = True
+    standardize: bool = False
+    stats_path: str | None = None
+    pe_init_std: float = 1.0
+    head_prior_bias: bool = False
 
 
 def resolve_device(name: str) -> torch.device:
@@ -204,25 +228,37 @@ def _crop(cube, mask, size: int, *, train: bool):
 class TransformedSplit(Dataset):
     """A SpectralWaste split plus the harness crop, flip, and downsample."""
 
-    def __init__(self, base, indices, crop_size, downsample, train: bool):
+    def __init__(
+        self,
+        base,
+        indices,
+        crop_size,
+        downsample,
+        train: bool,
+        standardizer: BandStandardizer | None = None,
+    ):
         self.base = base
         self.indices = list(indices)
         self.crop_size = crop_size
         self.downsample = downsample
         self.train = train
+        self.standardizer = standardizer
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, index):
         cube, mask = self.base[self.indices[index]]
-        return prepare_sample(
+        cube, mask = prepare_sample(
             cube,
             mask,
             train=self.train,
             crop_size=self.crop_size,
             downsample=self.downsample,
         )
+        if self.standardizer is not None:
+            cube = self.standardizer(cube)
+        return cube, mask
 
 
 def _seed_worker(worker_id: int) -> None:
@@ -257,14 +293,48 @@ def _loader(dataset, cfg: TrainConfig, shuffle: bool, pin_memory: bool, drop_las
     )
 
 
-def _split(cfg: TrainConfig, name: str, limit: int | None, train: bool) -> TransformedSplit:
+def _split(
+    cfg: TrainConfig,
+    name: str,
+    limit: int | None,
+    train: bool,
+    standardizer: BandStandardizer | None = None,
+) -> TransformedSplit:
     base = SpectralWasteDataset(cfg.data_root, split=name, random_flip=False)
     if len(base) == 0:
         raise RuntimeError(f"{name} split is empty under {cfg.data_root or 'SW_ROOT'}")
     n = len(base) if limit is None else min(len(base), limit)
     if n < 1:
         raise RuntimeError(f"{name} split has no images to load")
-    return TransformedSplit(base, range(n), cfg.crop_size, cfg.downsample, train=train)
+    return TransformedSplit(
+        base,
+        range(n),
+        cfg.crop_size,
+        cfg.downsample,
+        train=train,
+        standardizer=standardizer,
+    )
+
+
+def _resolve_standardizer(cfg: TrainConfig) -> BandStandardizer | None:
+    """Build a train-only band standardizer, or ``None`` when the flag is off."""
+    if not cfg.standardize:
+        return None
+    stats_path = cfg.stats_path
+    if stats_path is None:
+        stats_path = str(Path(cfg.out_dir) / "band_stats.pt")
+    # Stats from the raw train cubes (no aug / crop). Limits follow max_train_images
+    # so a smoke or subset run does not scan the whole split.
+    base = SpectralWasteDataset(cfg.data_root, split="train", random_flip=False)
+    if len(base) == 0:
+        raise RuntimeError(f"train split is empty under {cfg.data_root or 'SW_ROOT'}")
+    n = len(base) if cfg.max_train_images is None else min(len(base), cfg.max_train_images)
+    if n < 1:
+        raise RuntimeError("train split has no images to compute band stats")
+    subset = Subset(base, list(range(n)))
+    mean, std = load_or_compute_band_stats(stats_path, subset, split="train")
+    print(f"standardize: train band stats -> {stats_path}  (C={mean.numel()})")
+    return BandStandardizer(mean, std)
 
 
 def _iou_payload(iou) -> dict:
@@ -355,6 +425,10 @@ def _check_cfg(cfg: TrainConfig) -> None:
                 f"crop_size {cfg.crop_size} must be a multiple of patch {cfg.patch}; "
                 "the tokenizer drops the remainder and the head only pads it"
             )
+        if cfg.pe_init_std <= 0:
+            raise ValueError(f"pe_init_std must be > 0, got {cfg.pe_init_std}")
+    if cfg.head_prior_bias and cfg.model != "transformer":
+        raise ValueError("--head-prior-bias applies only to --model transformer")
 
 
 def _log_mode(path: Path, resume: bool) -> str:
@@ -464,9 +538,15 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    standardizer = _resolve_standardizer(cfg)
+
     # augment=False: no flips, and a training crop is a center crop.
-    train_ds = _split(cfg, "train", cfg.max_train_images, train=cfg.augment)
-    val_ds = _split(cfg, "val", cfg.max_val_images, train=False)
+    train_ds = _split(
+        cfg, "train", cfg.max_train_images, train=cfg.augment, standardizer=standardizer
+    )
+    val_ds = _split(
+        cfg, "val", cfg.max_val_images, train=False, standardizer=standardizer
+    )
     if needs_two and len(train_ds) < 2:
         raise RuntimeError(
             "Need at least 2 training images. BatchNorm cannot train on a batch of 1."
@@ -801,6 +881,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--in-channels", type=int, default=224, help="Bands in the cube. Real data is 224.")
     parser.add_argument(
+        "--standardize",
+        action="store_true",
+        help=(
+            "Per-band mean/std from the TRAIN split only, cached and applied to "
+            "train/val/test. Deviates from the paper's [0,1] scaling; see docs/INPUT-BLIND.md."
+        ),
+    )
+    parser.add_argument(
+        "--stats-path",
+        default=None,
+        help="Cache path for --standardize. Default: {out-dir}/band_stats.pt (not committed).",
+    )
+    parser.add_argument(
+        "--pe-init-std",
+        type=float,
+        default=1.0,
+        help="IndexBandPE init scale (transformer). Default 1.0 matches today's N(0,1). Try 0.02 with --standardize.",
+    )
+    parser.add_argument(
+        "--head-prior-bias",
+        action="store_true",
+        help="Init SegHead classifier bias to log train class priors (transformer only).",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Two train steps on 4 train images and 2 val images (1 epoch, batch 2). CPU wiring check, not a score.",
@@ -860,6 +964,10 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         patch=args.patch,
         group=args.group,
         augment=not args.no_aug,
+        standardize=bool(args.standardize),
+        stats_path=args.stats_path,
+        pe_init_std=args.pe_init_std,
+        head_prior_bias=bool(args.head_prior_bias),
     )
 
 
@@ -869,11 +977,14 @@ def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
     The transformer size fields live on ``cfg``. ``in_channels`` is the CLI
     ``--in-channels`` value (real cubes are 224) and is the tokenizer's
     band count. CNN runs ignore the transformer size fields.
+
+    When ``cfg.head_prior_bias`` is set, the SegHead classifier bias is
+    initialised to ``log`` of the hyperspectral train class priors.
     """
     if cfg.model == "cnn":
         return MiniNetSeg(in_channels=in_channels)
     if cfg.model == "transformer":
-        return BandTransformer(
+        model = BandTransformer(
             depth_spectral=cfg.depth_spectral,
             depth_spatial=cfg.depth_spatial,
             dim=cfg.dim,
@@ -883,7 +994,11 @@ def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
             n_bands=in_channels,
             group=cfg.group,
             patch=cfg.patch,
+            pe_init_std=cfg.pe_init_std,
         )
+        if cfg.head_prior_bias:
+            init_seg_head_prior_bias(model.head, HYPER_LT_TRAIN_PIXEL_COUNTS)
+        return model
     raise ValueError(f"model must be 'cnn' or 'transformer', got {cfg.model!r}")
 
 
