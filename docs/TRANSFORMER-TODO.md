@@ -81,6 +81,14 @@ PYTHONPATH=src python -m sw.train --model transformer --downsample 2 \
 
 Defaults are the recipe's small model: 2 spectral blocks, 6 spatial blocks, D=64, 4 heads, MLP ratio 4, group 16, patch 8. The harness prints the parameter count at startup. The recipe's formula, once the bodies match a pre-norm block, is about 50k parameters per block and about 0.5M overall. Re-measure. Do not treat that formula as the test.
 
+## Input-blind / learning-rate note
+
+On real cubes the transformer can sit at the class-prior loss for thousands of
+steps at `lr 1e-3` (raw `[0, 1]` input, no BatchNorm). The harness default
+`--lr` stays `1e-3` so flags match older runs; for transformer experiments
+prefer `3e-4`, and see `docs/INPUT-BLIND.md` for `--standardize` /
+`--pe-init-std` / `--head-prior-bias` and the A/B grid.
+
 ## Counts the tests lock
 
 `test_band_transformer_wiring_and_tokenizer_param_count` expects the tokenizer submodule at 66,624 parameters (conv 16→64, k8 s8, plus LayerNorm, plus the 14 by 64 group embedding). Pool, position, block, and head counts stay unlocked.
