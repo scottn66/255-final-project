@@ -59,12 +59,17 @@ PYTHONPATH=src python scripts/diag_input_blind.py
 PYTHONPATH=src python scripts/diag_input_blind.py --standardize --pe-init-std 0.02
 ```
 
-## Local A/B (Scott, 64 train / 8 val)
+## Local / Colab A/B (Scott, 64 train / 8 val)
 
-Protocol: 4000 steps, `--downsample 2`, batch 4, aug on, **constant lr**
-(`--no-cosine`), **no early stop**, `--model transformer` unless noted.
-Metric: first step where train FG mIoU ≥ 0.05; final train loss vs input-blind
-prior loss.
+Protocol: **4000 optimizer steps**, `--downsample 2`, batch 4, aug on,
+**constant lr** (`--no-cosine`), **no early stop**, `--model transformer`
+unless noted. With 64 train images and batch 4 there are 16 steps per epoch,
+so use `--epochs 250 --max-train-images 64 --max-val-images 8` (not a single
+epoch with `--max-train-steps 4000`; that flag is per-epoch).
+
+Metric: first epoch whose `train_fg_miou` is ≥ 0.05, reported as cumulative
+optimizer steps via `python -m sw.gates summarize`; also final train loss vs
+the input-blind prior (~0.81 on 64 cubes).
 
 Grid:
 
@@ -73,14 +78,57 @@ Grid:
   (it does **not** on this branch; skip until the optimiser-recipe PR lands)
 - CNN control: `--model cnn --standardize` at the CNN’s usual lr
 
-Example:
+Example (one arm):
 
 ```bash
 PYTHONPATH=src python -m sw.train --model transformer --downsample 2 \
-  --batch-size 4 --max-train-steps 4000 --no-cosine \
+  --batch-size 4 --max-train-images 64 --max-val-images 8 \
+  --epochs 250 --no-cosine \
   --lr 3e-4 --standardize --pe-init-std 0.02 \
   --out-dir runs/tf_std_pe002_lr3e4
 ```
+
+Summarize after (or while) it runs:
+
+```bash
+PYTHONPATH=src python -m sw.gates summarize runs/tf_std_pe002_lr3e4
+```
+
+### Colab (Run all)
+
+Open [`notebooks/07_input_blind_ab.ipynb`](../notebooks/07_input_blind_ab.ipynb)
+on this branch (Open in Colab badge at the top). It clones the branch, installs,
+downloads to `/content/data`, runs the synthetic diag + a standardize smoke,
+then launches the priority grid (three transformer arms at `lr 3e-4` plus CNN
+`--standardize`) as resumable Drive jobs. Edit `AB_RUNS` in Settings to add
+the `1e-3` arms.
+
+Or clone by hand:
+
+```bash
+git clone -b cursor/colab-input-blind-ab-2779 \
+  https://github.com/scottn66/255-final-project.git
+cd 255-final-project
+pip install -q -r requirements.txt
+bash scripts/get_data.sh /content/data
+export SW_ROOT=/content/data/spectralwaste_segmentation
+```
+
+### After escape: first serious screen (full official train split)
+
+Once an arm clears train FG ≥ 0.05 well before 4000 steps, run a 30-epoch
+half-resolution screen on the full 514/167 split (still not a final score):
+
+```bash
+PYTHONPATH=src python -m sw.train --model transformer --downsample 2 \
+  --epochs 30 --batch-size 4 --num-workers 2 --device cuda --no-cosine \
+  --lr 3e-4 --standardize --pe-init-std 0.02 \
+  --out-dir /content/drive/MyDrive/sw_runs/tf_screen_std_pe002
+```
+
+Each epoch line already prints `train_fg_miou` and `val_fg_miou`. Compare
+against `cnn_ds2` (0.391) in `docs/RESULTS.md`, and say that the row used
+per-band standardisation.
 
 ## Reporting note
 

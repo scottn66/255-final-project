@@ -97,6 +97,11 @@ _PROC = Path("/proc")
 
 _SPLIT_FILES = (("hyper", ".tiff"), ("labels_hyper_lt", ".png"))
 
+# Input-blind A/B (docs/INPUT-BLIND.md): first epoch whose train FG mIoU
+# reaches this. Metrics are one row per epoch; steps_to_escape sums the
+# per-epoch ``steps`` field through that epoch.
+ESCAPE_FG = 0.05
+
 
 def read_metrics(path) -> list[dict]:
     """The rows of a ``metrics.jsonl`` written by ``sw.train``, one per epoch, in epoch order.
@@ -138,6 +143,78 @@ def first_pass_epoch(rows, classes=LARGE_CLASSES, threshold=PASS_IOU):
         if all(value is not None and value > threshold for value in values):
             return int(row["epoch"])
     return None
+
+
+def summarize_escape(rows, threshold: float = ESCAPE_FG) -> dict:
+    """When train FG mIoU first escapes the input-blind prior, from ``metrics.jsonl`` rows.
+
+    ``sw.train`` logs one row per epoch, not per optimizer step. This
+    helper finds the first epoch whose ``train_fg_miou`` is at least
+    ``threshold`` (default ``ESCAPE_FG`` = 0.05) and reports:
+
+    * ``escape_epoch`` / ``steps_to_escape`` — that epoch, and the sum of
+      ``steps`` through it (optimizer steps so far). Both ``None`` if the
+      run never cleared the threshold.
+    * ``final_train_loss`` / ``final_train_fg_miou`` / ``best_val_fg_miou``
+      — last-row loss and train FG, and the best val FG across the log.
+    * ``epochs`` / ``total_steps`` — how far the log went.
+
+    Used by ``notebooks/07_input_blind_ab.ipynb`` and
+    ``python -m sw.gates summarize``.
+    """
+    rows = list(rows)
+    if not rows:
+        raise ValueError("no metrics rows")
+    if "train_fg_miou" not in rows[0]:
+        raise KeyError(
+            "metrics rows have no train_fg_miou; need the harness with training-set metrics"
+        )
+    escape_epoch = None
+    steps_to_escape = None
+    cumulative = 0
+    for row in rows:
+        cumulative += int(row.get("steps") or 0)
+        fg = row.get("train_fg_miou")
+        if escape_epoch is None and fg is not None and float(fg) >= threshold:
+            escape_epoch = int(row["epoch"])
+            steps_to_escape = cumulative
+    best_val = None
+    for row in rows:
+        v = row.get("val_fg_miou")
+        if v is None:
+            continue
+        best_val = float(v) if best_val is None else max(best_val, float(v))
+    last = rows[-1]
+    last_fg = last.get("train_fg_miou")
+    return {
+        "threshold": threshold,
+        "escape_epoch": escape_epoch,
+        "steps_to_escape": steps_to_escape,
+        "final_train_loss": float(last["train_loss"]),
+        "final_train_fg_miou": None if last_fg is None else float(last_fg),
+        "best_val_fg_miou": best_val,
+        "epochs": int(last["epoch"]),
+        "total_steps": cumulative,
+    }
+
+
+def format_escape_line(tag: str, summary: dict) -> str:
+    """One monitor / table line for ``summarize_escape``."""
+    esc = summary["escape_epoch"]
+    if esc is None:
+        esc_text = f"no escape (train FG never >= {summary['threshold']})"
+    else:
+        esc_text = f"escape epoch {esc} (~{summary['steps_to_escape']} steps)"
+    final_fg = summary["final_train_fg_miou"]
+    fg_text = "nan" if final_fg is None else f"{final_fg:.3f}"
+    best_val = summary["best_val_fg_miou"]
+    val_text = "nan" if best_val is None else f"{best_val:.3f}"
+    return (
+        f"{tag:28s} {esc_text}  "
+        f"final loss {summary['final_train_loss']:.4f}  "
+        f"train FG {fg_text}  best val FG {val_text}  "
+        f"({summary['epochs']} ep / {summary['total_steps']} steps)"
+    )
 
 
 def judge_overfit(
@@ -576,7 +653,29 @@ def _cli(argv=None) -> int:
     run_parser = sub.add_parser("run", help="run sw.train once into --out-dir (skip if done, resume if partial)")
     run_parser.add_argument("--out-dir", required=True)
     run_parser.add_argument("train_args", nargs=argparse.REMAINDER, help="sw.train flags after --")
+    sum_parser = sub.add_parser(
+        "summarize",
+        help="print when train FG mIoU first escapes the input-blind prior (metrics.jsonl)",
+    )
+    sum_parser.add_argument(
+        "paths",
+        nargs="+",
+        help="metrics.jsonl files, or run directories that contain them",
+    )
+    sum_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=ESCAPE_FG,
+        help=f"train FG mIoU escape threshold (default {ESCAPE_FG})",
+    )
     args = parser.parse_args(argv)
+    if args.command == "summarize":
+        for raw in args.paths:
+            path = Path(raw)
+            metrics = path / "metrics.jsonl" if path.is_dir() else path
+            summary = summarize_escape(read_metrics(metrics), threshold=args.threshold)
+            print(format_escape_line(path.name, summary))
+        return 0
     train_args = args.train_args[1:] if args.train_args[:1] == ["--"] else args.train_args
     run(args.out_dir, train_args)
     return 0

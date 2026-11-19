@@ -71,11 +71,12 @@ The CLI reads `SW_ROOT` (or `--data-root`): a folder with `hyper/` and `labels_h
 
 ### 8. Colab
 
-Run the smoke, memory and overfit steps in `docs/COLAB.md` first ("Transformer: first runs, in order"). Run this only after the overfit check passes. Half resolution, same idea as the CNN checkup run. A 256 cube with `--downsample 2` is 128, patch 8 is a 16 by 16 grid (256 tokens).
+Run the smoke, memory and overfit steps in `docs/COLAB.md` first ("Transformer: first runs, in order"). If the model stays background-only past a few hundred steps, run the input-blind A/B notebook (`notebooks/07_input_blind_ab.ipynb`, flags in `docs/INPUT-BLIND.md`) before a long screen. Run a 30-epoch half-resolution screen only after overfit passes and an A/B arm escapes. A 256 cube with `--downsample 2` is 128, patch 8 is a 16 by 16 grid (256 tokens).
 
 ```bash
 PYTHONPATH=src python -m sw.train --model transformer --downsample 2 \
   --epochs 30 --batch-size 4 --num-workers 2 --device cuda \
+  --lr 3e-4 --standardize --pe-init-std 0.02 --no-cosine \
   --out-dir runs/transformer
 ```
 
