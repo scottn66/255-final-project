@@ -66,6 +66,12 @@ A run that `sw.gates` started without these flags resumes as before. Adding one 
 
 `notebooks/06_transformer_gates.ipynb` runs everything in this section in order with Runtime → Run all: setup, data, smoke, memory, overfit, and the half-resolution screening runs. It stops at the first failed gate.
 
+If the transformer stays background-only on more than a handful of cubes, use
+`notebooks/07_input_blind_ab.ipynb` on `wp6-colab-gates` (see
+[`docs/INPUT-BLIND.md`](INPUT-BLIND.md)): train-only `--standardize`,
+`--pe-init-std 0.02`, and `lr 3e-4`. That notebook’s default clone branch is
+`wp6-colab-gates`.
+
 Run all asks once for the Drive sign-in. Keep its monitor cell running: an idle notebook can be recycled. After a disconnect, Run all again:
 - Gates 1 and 2 are skipped once `gates.json` on Drive records them for the commit.
 - Screening runs resume from `last.pt`.

@@ -200,6 +200,51 @@ def test_judge_refuses_logs_it_cannot_read():
         gates.judge_overfit([])
 
 
+# --- summarize_escape (input-blind A/B) ---------------------------------------------------
+
+
+def test_summarize_escape_finds_first_epoch_and_sums_steps():
+    rows = [
+        {"epoch": 1, "train_loss": 0.81, "train_fg_miou": 0.0, "val_fg_miou": 0.0, "steps": 16},
+        {"epoch": 2, "train_loss": 0.80, "train_fg_miou": 0.04, "val_fg_miou": 0.01, "steps": 16},
+        {"epoch": 3, "train_loss": 0.70, "train_fg_miou": 0.05, "val_fg_miou": 0.02, "steps": 16},
+        {"epoch": 4, "train_loss": 0.60, "train_fg_miou": 0.12, "val_fg_miou": 0.08, "steps": 16},
+    ]
+    summary = gates.summarize_escape(rows)
+    assert summary["escape_epoch"] == 3
+    assert summary["steps_to_escape"] == 48
+    assert summary["final_train_loss"] == pytest.approx(0.60)
+    assert summary["final_train_fg_miou"] == pytest.approx(0.12)
+    assert summary["best_val_fg_miou"] == pytest.approx(0.08)
+    assert summary["total_steps"] == 64
+    line = gates.format_escape_line("tf_std_pe002", summary)
+    assert "escape epoch 3" in line
+    assert "~48 steps" in line
+
+
+def test_summarize_escape_never_cleared():
+    rows = [
+        {"epoch": 1, "train_loss": 0.81, "train_fg_miou": 0.0, "val_fg_miou": None, "steps": 16},
+        {"epoch": 2, "train_loss": 0.81, "train_fg_miou": 0.049, "val_fg_miou": 0.0, "steps": 16},
+    ]
+    summary = gates.summarize_escape(rows)
+    assert summary["escape_epoch"] is None
+    assert summary["steps_to_escape"] is None
+    assert summary["best_val_fg_miou"] == pytest.approx(0.0)
+    assert "no escape" in gates.format_escape_line("raw", summary)
+
+
+def test_summarize_cli(tmp_path):
+    rows = [
+        {"epoch": 1, "train_loss": 0.9, "train_fg_miou": 0.0, "val_fg_miou": 0.0, "steps": 4},
+        {"epoch": 2, "train_loss": 0.5, "train_fg_miou": 0.1, "val_fg_miou": 0.05, "steps": 4},
+    ]
+    run = tmp_path / "ab_run"
+    run.mkdir()
+    (run / "metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert gates._cli(["summarize", str(run)]) == 0
+
+
 def test_overfit_constants():
     assert list(gates.OVERFIT_STEMS) == sorted(set(gates.OVERFIT_STEMS)) and len(gates.OVERFIT_STEMS) == 4
     assert set(LARGE) | set(gates.THIN_CLASSES) == set(CLASS_NAMES) - {"background"}

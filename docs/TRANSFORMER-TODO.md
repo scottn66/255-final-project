@@ -71,15 +71,24 @@ The CLI reads `SW_ROOT` (or `--data-root`): a folder with `hyper/` and `labels_h
 
 ### 8. Colab
 
-Run the smoke, memory and overfit steps in `docs/COLAB.md` first ("Transformer: first runs, in order"). Run this only after the overfit check passes. Half resolution, same idea as the CNN checkup run. A 256 cube with `--downsample 2` is 128, patch 8 is a 16 by 16 grid (256 tokens).
+Run the smoke, memory and overfit steps in `docs/COLAB.md` first ("Transformer: first runs, in order"). If the model stays background-only past a few hundred steps, run the input-blind A/B notebook (`notebooks/07_input_blind_ab.ipynb`, flags in `docs/INPUT-BLIND.md`) before a long screen. Run a 30-epoch half-resolution screen only after overfit passes and an A/B arm escapes. A 256 cube with `--downsample 2` is 128, patch 8 is a 16 by 16 grid (256 tokens).
 
 ```bash
 PYTHONPATH=src python -m sw.train --model transformer --downsample 2 \
   --epochs 30 --batch-size 4 --num-workers 2 --device cuda \
+  --lr 3e-4 --standardize --pe-init-std 0.02 --no-cosine \
   --out-dir runs/transformer
 ```
 
 Defaults are the recipe's small model: 2 spectral blocks, 6 spatial blocks, D=64, 4 heads, MLP ratio 4, group 16, patch 8. The harness prints the parameter count at startup. The recipe's formula, once the bodies match a pre-norm block, is about 50k parameters per block and about 0.5M overall. Re-measure. Do not treat that formula as the test.
+
+## Input-blind / learning-rate note
+
+On real cubes the transformer can sit at the class-prior loss for thousands of
+steps at `lr 1e-3` (raw `[0, 1]` input, no BatchNorm). The harness default
+`--lr` stays `1e-3` so flags match older runs; for transformer experiments
+prefer `3e-4`, and see `docs/INPUT-BLIND.md` for `--standardize` /
+`--pe-init-std` / `--head-prior-bias` and the A/B grid.
 
 ## Counts the tests lock
 

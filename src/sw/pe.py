@@ -49,11 +49,24 @@ def sinusoidal_wavelength_pe(
 
 
 class IndexBandPE(nn.Module):
-    """Learned embedding of band position. Row ``i`` encodes band ``i``."""
+    """Learned embedding of band position. Row ``i`` encodes band ``i``.
 
-    def __init__(self, n_bands: int, d_model: int):
+    ``nn.Embedding`` defaults to ``N(0, 1)``. ``init_std`` scales that table
+    in place when it differs from ``1.0`` (no extra RNG draw, so the rest of
+    the model keeps the same initialisation as a plain Embedding).
+    """
+
+    def __init__(self, n_bands: int, d_model: int, init_std: float = 1.0):
         super().__init__()
+        if init_std <= 0:
+            raise ValueError(f"init_std must be > 0, got {init_std}")
         self.table = nn.Embedding(n_bands, d_model)
+        self.init_std = float(init_std)
+        # Default 1.0 leaves the Embedding's N(0, 1) draw alone so a run with
+        # --pe-init-std 1.0 matches today's weights under the same seed.
+        if self.init_std != 1.0:
+            with torch.no_grad():
+                self.table.weight.mul_(self.init_std)
 
     def forward(self, n: int | None = None) -> torch.Tensor:
         c = self.table.num_embeddings if n is None else n

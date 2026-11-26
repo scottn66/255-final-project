@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from sw.models.tokenizer import BandTokenizer
 from sw.attention import FeedForward, MultiHeadSelfAttention, ResidualSelfAttentionBlock
+from sw.data import HYPER_LT_TRAIN_PIXEL_COUNTS
 
 
 def _check_block_args(dim: int, heads: int, mlp_ratio: float) -> None:
@@ -447,6 +448,8 @@ class SegHead(nn.Module):
         # Dropout2d zeroes whole channels (the same channels at every pixel of
         # an image) in training. Off by default.
         self.drop = nn.Dropout2d(dropout)
+        # Conv2d bias defaults to a small uniform draw, not class priors. Use
+        # :func:`init_seg_head_prior_bias` (``--head-prior-bias``) for log priors.
         self.classifier = nn.Conv2d(hidden, num_classes, kernel_size=1)
 
     def forward(
@@ -488,6 +491,32 @@ class SegHead(nn.Module):
         return self.classifier(self.drop(y))  # (B, num_classes, H, W)
 
 
+def init_seg_head_prior_bias(
+    head: SegHead,
+    counts=HYPER_LT_TRAIN_PIXEL_COUNTS,
+) -> torch.Tensor:
+    """Set ``head.classifier.bias`` to ``log`` class priors from pixel counts.
+
+    Returns the bias vector that was written. Counts must be positive and
+    length ``head.num_classes``. Default counts are the hyperspectral train
+    pixel totals in ``sw.data.HYPER_LT_TRAIN_PIXEL_COUNTS``.
+    """
+    if head.classifier.bias is None:
+        raise ValueError("SegHead classifier has no bias")
+    counts_t = torch.as_tensor(list(counts), dtype=torch.float32)
+    if counts_t.numel() != head.num_classes:
+        raise ValueError(
+            f"expected {head.num_classes} class counts, got {counts_t.numel()}"
+        )
+    if torch.any(counts_t <= 0):
+        raise ValueError("class counts must be positive")
+    prior = counts_t / counts_t.sum()
+    bias = prior.clamp_min(torch.finfo(prior.dtype).tiny).log()
+    with torch.no_grad():
+        head.classifier.bias.copy_(bias.to(device=head.classifier.bias.device))
+    return bias
+
+
 class BandTransformer(nn.Module):
     """Spectral-then-spatial band-token segmenter.
 
@@ -523,6 +552,7 @@ class BandTransformer(nn.Module):
         n_bands: int = 224,
         group: int = 16,
         patch: int = 8,
+        pe_init_std: float = 1.0,
     ):
         super().__init__()
         if depth_spectral < 0 or depth_spatial < 0:
@@ -536,6 +566,8 @@ class BandTransformer(nn.Module):
             raise ValueError(f"patch must be >= 1, got {patch}")
         if group < 1:
             raise ValueError(f"group must be >= 1, got {group}")
+        if pe_init_std <= 0:
+            raise ValueError(f"pe_init_std must be > 0, got {pe_init_std}")
 
         self.depth_spectral = depth_spectral
         self.depth_spatial = depth_spatial
@@ -544,9 +576,14 @@ class BandTransformer(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.num_classes = num_classes
         self.patch = patch
+        self.pe_init_std = float(pe_init_std)
 
         self.tokenizer = BandTokenizer(
-            n_bands=n_bands, d_model=dim, group=group, patch=patch
+            n_bands=n_bands,
+            d_model=dim,
+            group=group,
+            patch=patch,
+            pe_init_std=pe_init_std,
         )
         self.spectral = nn.ModuleList(
             [SpectralBlock(dim, heads, mlp_ratio) for _ in range(depth_spectral)]
