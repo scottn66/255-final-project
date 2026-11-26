@@ -119,3 +119,22 @@ Each `metrics.jsonl` row has `train_fg_miou` and `train_per_class_iou` (from the
 ```bash
 PYTHONPATH=src python -m sw.train --resume /content/drive/MyDrive/sw_runs/cnn/last.pt --epochs 30 --batch-size 4 --num-workers 2 --device cuda --patience 8 --out-dir /content/drive/MyDrive/sw_runs/cnn
 ```
+
+## Test score
+
+Training scores the validation split only. When a configuration is final, score its best-validation checkpoint on the test split, once:
+
+```bash
+PYTHONPATH=src python -m sw.evaluate --checkpoint /content/drive/MyDrive/sw_runs/cnn/best.pt --split test --device cuda
+```
+
+It needs no training flags. The model, `--downsample` and `--standardize` come from the config saved in the checkpoint. A `--standardize` run also needs its own `band_stats.pt`: the `--stats-path` the run set, else the file next to the checkpoint. If that file is missing the command stops. It does not recompute, and it does not pick up another file; pass the run's file with `--stats-path`.
+
+Before it touches test, the command scores val and compares the FG mIoU with the one `best.pt` recorded. It prints `val check: MATCH` and goes on, or stops with `MISMATCH` and scores nothing. A mismatch means the data folder, the statistics file or the code is not what the run used. Run `--split val` alone first to see the same check; its FG mIoU is the best epoch's in `metrics.jsonl`. The check is skipped, with a printed reason, for `last.pt` and for runs trained with `--crop-size` or `--max-val-images`.
+
+It prints per-class IoU, FG mIoU and pixel accuracy, and writes `eval_test.json` next to the checkpoint (`eval_test_last.json` for `last.pt`). The rules for test:
+
+- Once. A second test run for the same checkpoint is refused unless you pass `--force`. Test is looked at once per final configuration, never to choose between runs.
+- If you retrain into the same folder, the old `eval_test.json` belongs to the old `best.pt`. The command says the file is stale and stops. Move the file away or pass `--force`.
+- The test folder must hold the official 171 images. A partly synced Drive folder is refused (`--allow-partial-split` scores it anyway and marks the file `"official_split": false`).
+- For a wiring check use `--split val --max-images 8`. It writes no file and its number is not a score. On test `--max-images` is limited to 8 images.
