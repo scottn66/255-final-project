@@ -11,6 +11,11 @@ and device paths, and a short training run that has to fit a synthetic
 task. The ``SpectralBlock`` and ``SpectralPool`` tests are still
 shape-only. Parameter counts are locked from the layer formulas, down to
 the model total (488,487).
+
+The last section is the band-collapsed control (``tokenizer="collapsed"``):
+its parameter match with the fused model, and the reason it has its own
+tokenizer (it sees the order of the band groups; the band tokenizer without
+spectral blocks does not).
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from PIL import Image
 
 from sw.models.cnn import MiniNetSeg, count_parameters
 from sw.models.tokenizer import BandTokenizer
+from sw.models.tokenizer import CollapsedTokenizer
 from sw.attention import ResidualSelfAttentionBlock
 import torch.nn.functional as F
 from sw.models.transformer import (
@@ -893,3 +899,334 @@ def test_transformer_smoke(tmp_path):
         rows = [json.loads(line) for line in handle if line.strip()]
     assert len(rows) == 1
     assert rows[0]["steps"] == 2
+
+
+# --- The band-collapsed control: BandTransformer(0, 8, tokenizer="collapsed") ---
+
+
+def _trainable(module):
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+def test_collapsed_control_is_matched_on_parameters():
+    """The control for "the same backbone with the band axis collapsed
+    first, at matched parameters".
+
+    Matched parameters means the total of trainable parameters of the whole
+    model: control ``BandTransformer(0, 8, tokenizer="collapsed")`` against
+    fused ``BandTransformer(2, 6)``. FLOPs and step time are not matched,
+    and nothing here measures them.
+    """
+    fused = BandTransformer(2, 6)
+    control = BandTransformer(0, 8, tokenizer="collapsed")
+    assert fused.tokenizer_kind == "band" and isinstance(fused.tokenizer, BandTokenizer)
+    assert control.tokenizer_kind == "collapsed" and isinstance(control.tokenizer, CollapsedTokenizer)
+    assert control.tokenizer.n_groups == 1
+    assert (len(control.spectral), len(control.spatial)) == (0, 8)
+
+    block = 49_984  # SpectralBlock == SpatialBlock at mlp_ratio 4
+    assert _trainable(fused.tokenizer) == 66_624
+    assert _trainable(control.tokenizer) == 69_328
+    assert _trainable(fused) == 66_624 + 2 * block + 6 * block + 21_991 == 488_487
+    assert _trainable(control) == 69_328 + 8 * block + 21_991 == 491_191
+    # Nothing is frozen, so trainable is every parameter.
+    assert count_parameters(fused) == 488_487
+    assert count_parameters(control) == 491_191
+
+    gap = _trainable(control) - _trainable(fused)
+    assert gap == 2_704  # the 1x1 conv (3,600) in place of the group embedding (896)
+    assert gap < 0.01 * _trainable(fused)  # 0.55% of the fused total
+
+
+def test_collapsed_control_shape_and_gradients():
+    torch.manual_seed(0)
+    model = BandTransformer(0, 8, tokenizer="collapsed")
+    images = torch.randn(2, 224, 30, 40)
+    logits = model(images)
+    assert logits.shape == (2, 7, 30, 40)
+    assert torch.isfinite(logits).all()
+    logits.square().mean().backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
+    # One group has no order to encode: no group embedding anywhere.
+    assert not any("group_emb" in key for key in model.state_dict())
+    assert "tokenizer.reduce.weight" in model.state_dict()
+
+
+def test_collapsed_control_uses_the_same_forward():
+    """``BandTransformer.forward`` is unchanged: the tokens keep a group axis
+    of length 1, and the mean over one group is the identity."""
+    torch.manual_seed(0)
+    model = BandTransformer(0, 2, tokenizer="collapsed").eval()
+    seen = {}
+    hooks = [
+        model.tokenizer.register_forward_hook(lambda m, a, o: seen.update(tokens=o[0], grid=o[1])),
+        model.pool.register_forward_hook(lambda m, a, o: seen.update(pool_in=a[0], pool_out=o)),
+    ]
+    try:
+        with torch.no_grad():
+            logits = model(torch.rand(1, 224, 30, 47))
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert logits.shape == (1, 7, 30, 47)
+    assert seen["grid"] == (3, 5)
+    assert seen["tokens"].shape == (1, 15, 1, 64)  # (B, N, G = 1, D)
+    assert seen["pool_in"] is seen["tokens"]  # no spectral block in between
+    assert torch.equal(seen["pool_out"], seen["tokens"][:, :, 0])  # exactly, not approximately
+
+
+def test_tokenizer_argument_is_validated():
+    with pytest.raises(ValueError, match="tokenizer must be"):
+        BandTransformer(0, 8, tokenizer="pca")
+    # With one group a spectral block is a per-token map, not attention over
+    # bands. The parameter total would not show it (both block types have
+    # 49,984 parameters, so 1+7 and 2+6 would also count 491,191).
+    with pytest.raises(ValueError, match="depth_spectral=0"):
+        BandTransformer(1, 7, tokenizer="collapsed")
+    with pytest.raises(ValueError, match="depth_spectral=0"):
+        BandTransformer(2, 6, tokenizer="collapsed")
+
+    # pe_init_std and group have no effect with "collapsed" (no IndexBandPE,
+    # no groups). That is documented, not an error.
+    torch.manual_seed(0)
+    plain = BandTransformer(0, 2, tokenizer="collapsed")
+    torch.manual_seed(0)
+    other = BandTransformer(0, 2, tokenizer="collapsed", pe_init_std=0.02, group=8)
+    assert list(plain.state_dict()) == list(other.state_dict())
+    for key, value in plain.state_dict().items():
+        assert torch.equal(value, other.state_dict()[key]), key
+
+
+def test_collapsed_ignores_group_but_keeps_the_range_checks():
+    BandTransformer(0, 1, group=10, tokenizer="collapsed")  # 224 % 10 != 0: no groups, so no error
+    with pytest.raises(ValueError, match="divisible"):
+        BandTransformer(0, 1, group=10)  # the band tokenizer still refuses it
+    with pytest.raises(ValueError, match="pe_init_std"):
+        BandTransformer(0, 1, pe_init_std=0, tokenizer="collapsed")
+    with pytest.raises(ValueError, match="group"):
+        BandTransformer(0, 1, group=0, tokenizer="collapsed")
+
+
+def test_tokenizer_is_the_last_constructor_argument():
+    """A positional call written before ``tokenizer`` existed still means what it meant."""
+    import inspect
+
+    assert list(inspect.signature(BandTransformer).parameters)[-2:] == ["pe_init_std", "tokenizer"]
+    torch.manual_seed(0)
+    positional = BandTransformer(1, 1, 32, 2, 4.0, 7, 32, 8, 4, 0.5)
+    torch.manual_seed(0)
+    keyword = BandTransformer(
+        1, 1, dim=32, heads=2, mlp_ratio=4.0, num_classes=7, n_bands=32, group=8, patch=4, pe_init_std=0.5
+    )
+    assert positional.tokenizer_kind == "band"
+    assert list(positional.state_dict()) == list(keyword.state_dict())
+    for key, value in positional.state_dict().items():
+        assert torch.equal(value, keyword.state_dict()[key]), key
+
+
+def test_collapsed_control_passes_its_sizes_to_the_tokenizer():
+    """``dim``, ``patch`` and ``n_bands`` reach ``CollapsedTokenizer``. Every
+    other control test builds the default sizes."""
+    torch.manual_seed(0)
+    model = BandTransformer(0, 1, dim=32, heads=2, n_bands=48, patch=4, tokenizer="collapsed").eval()
+    assert model.tokenizer.reduce.weight.shape == (16, 48, 1, 1)  # n_bands in, reduce stays 16
+    assert model.tokenizer.proj.weight.shape == (32, 16, 4, 4)  # dim out, patch kernel
+    assert model.tokenizer.proj.stride == (4, 4)
+    x = torch.rand(1, 48, 12, 20)
+    tokens, grid = model.tokenizer(x)
+    assert grid == (3, 5)
+    assert tokens.shape == (1, 15, 1, 32)
+    with torch.no_grad():
+        assert model(x).shape == (1, 7, 12, 20)
+
+
+def test_band_path_draws_the_same_weights_as_before():
+    """The default path must not gain, lose or reorder a random draw.
+
+    Build the parts by hand in the order ``BandTransformer`` always built
+    them (tokenizer, spectral blocks, spatial blocks, head) from the same
+    seed. Every tensor is bit-identical, and the generator ends in the same
+    state. So ``BandTransformer.__init__`` adds no draw of its own. A draw
+    that changes inside one of the parts is for the two tests below.
+    """
+    for kwargs in ({}, {"tokenizer": "band"}):
+        torch.manual_seed(3)
+        model = BandTransformer(2, 6, **kwargs)
+        next_draw = torch.rand(4)
+
+        torch.manual_seed(3)
+        parts = torch.nn.ModuleDict(
+            {
+                "tokenizer": BandTokenizer(n_bands=224, d_model=64, group=16, patch=8, pe_init_std=1.0),
+                "spectral": torch.nn.ModuleList([SpectralBlock(64, 4, 4.0) for _ in range(2)]),
+                "spatial": torch.nn.ModuleList([SpatialBlock(64, 4, 4.0) for _ in range(6)]),
+                "head": SegHead(64, num_classes=7, patch=8),
+            }
+        )
+        assert torch.equal(torch.rand(4), next_draw)  # the same number of draws
+
+        expected = parts.state_dict()
+        assert list(model.state_dict()) == list(expected)  # same keys, same order
+        for key, value in model.state_dict().items():
+            assert torch.equal(value, expected[key]), key
+
+
+def test_band_tokenizer_draws_its_weights_in_the_original_order():
+    """The band tokenizer's layers, built by hand in the order it always
+    built them (patch conv, LayerNorm, group embedding), are bit-identical
+    from the same seed. No pinned numbers, so this holds on any torch build."""
+    from sw.pe import IndexBandPE
+
+    torch.manual_seed(5)
+    tokenizer = BandTokenizer()
+    next_draw = torch.rand(4)
+
+    torch.manual_seed(5)
+    parts = torch.nn.ModuleDict(
+        {
+            "proj": torch.nn.Conv2d(16, 64, kernel_size=8, stride=8),
+            "norm": torch.nn.LayerNorm(64),
+            "group_emb": IndexBandPE(14, 64, init_std=1.0),
+        }
+    )
+    assert torch.equal(torch.rand(4), next_draw)  # the same number of draws
+
+    expected = parts.state_dict()
+    assert list(tokenizer.state_dict()) == list(expected)  # same keys, same order
+    for key, value in tokenizer.state_dict().items():
+        assert torch.equal(value, expected[key]), key
+
+
+def test_default_model_weights_are_pinned_to_the_commit_before_the_tokenizer_argument():
+    """Seed 0 gives the weights it gave at b95f1b1, the commit before ``tokenizer=``.
+
+    The two tests above build their references with our own constructors
+    (``SpectralBlock``, ``SpatialBlock``, ``SegHead``, ``IndexBandPE``), so
+    they cannot see a random draw added, removed or moved inside one of
+    those. These numbers can. They were measured on the b95f1b1 tree
+    (torch 2.15, CPU, 1 and 4 threads).
+
+    The first lines draw the model's first two random layers from torch
+    alone. If this torch build gives other numbers for them, the pins say
+    nothing about our code, and the test is skipped.
+    """
+    proj_pin = [-0.00023396313190460205, 0.01676386222243309, -0.025720160454511642]
+    emb_pin = [-1.2728432416915894, 0.3214237093925476, 0.08527976274490356]
+    torch.manual_seed(0)
+    conv = torch.nn.Conv2d(16, 64, kernel_size=8, stride=8)
+    table = torch.nn.Embedding(14, 64)
+    conv_drawn, table_drawn = conv.weight[0, 0, 0, :3].tolist(), table.weight[0, :3].tolist()
+    if conv_drawn != pytest.approx(proj_pin, abs=1e-6) or table_drawn != pytest.approx(emb_pin, abs=1e-5):
+        pytest.skip("this torch build draws other numbers than torch 2.15 CPU, where the pins were measured")
+
+    torch.manual_seed(0)
+    state = BandTransformer(2, 6).state_dict()
+    next_draw = torch.rand(1).item()
+    assert len(state) == 145
+    sums = [value.double().sum().item() for value in state.values()]
+    assert sum(sums) == pytest.approx(1185.3963280574933, abs=1e-3)
+    # Weighted by the key's position: two same-shaped tensors that trade their draws show here.
+    assert sum((i + 1) * s for i, s in enumerate(sums)) == pytest.approx(79615.20497431335, abs=1e-2)
+    assert state["tokenizer.proj.weight"][0, 0, 0, :3].tolist() == pytest.approx(proj_pin, abs=1e-6)
+    assert state["tokenizer.group_emb.table.weight"][0, :3].tolist() == pytest.approx(emb_pin, abs=1e-5)
+    assert state["head.classifier.bias"][:3].tolist() == pytest.approx(
+        [-0.1236930564045906, 0.08112476021051407, 0.014073949307203293], abs=1e-6
+    )
+    assert next_draw == pytest.approx(0.012832105159759521, abs=1e-7)
+
+
+def _band_order_change(model):
+    """max |logits(x) - logits(x_permuted)| in eval mode.
+
+    ``x`` is one random ``(1, 224, 16, 16)`` input. Its 224 bands are split
+    into 14 contiguous groups of 16, and ``x_permuted`` has the groups in
+    the order of a fixed seeded permutation that is not the identity. Bands
+    keep their order inside a group.
+    """
+    generator = torch.Generator().manual_seed(0)
+    x = torch.rand(1, 224, 16, 16, generator=generator)
+    order = torch.randperm(14, generator=generator)
+    assert sorted(order.tolist()) == list(range(14))
+    assert order.tolist() != list(range(14))  # not the identity
+    permuted = x.reshape(1, 14, 16, *x.shape[-2:])[:, order].reshape(x.shape)
+    model.eval()
+    with torch.no_grad():
+        return (model(x) - model(permuted)).abs().max().item()
+
+
+def test_only_the_collapsed_tokenizer_sees_band_order():
+    """Why the control needs its own tokenizer.
+
+    The band tokenizer without spectral blocks is blind to the order of the
+    14 band groups: a shared conv, an added group embedding and a mean over
+    groups give the same pooled token whatever order the groups come in.
+    Only float rounding is left. So ``BandTransformer(0, N)`` cannot tell
+    which of the 14 groups a feature sits in (it still sees a band's
+    position inside its group), and it is not the band-collapsed control.
+    The collapsed tokenizer has its own weights for every band, so its
+    logits change.
+
+    Measured before the thresholds were chosen (torch 2.15, CPU, 1 and 4
+    threads, model seeds 0 to 19 on this input): band 1.5e-8 to 2.2e-8,
+    which is float32 rounding of logits near 0.2 (about 3e-17 in float64);
+    collapsed 2.6e-3 to 6.8e-3. Each threshold is more than 10 times away
+    from the worst value on its side, and the smallest collapsed change is
+    about 1e5 times the largest band change.
+    """
+    band, collapsed = [], []
+    for seed in (0, 1, 2):
+        torch.manual_seed(seed)
+        band.append(_band_order_change(BandTransformer(0, 2)))
+        torch.manual_seed(seed)
+        collapsed.append(_band_order_change(BandTransformer(0, 2, tokenizer="collapsed")))
+    assert max(band) < 1e-6, band  # order-blind
+    assert min(collapsed) > 1e-4, collapsed  # sees band order
+    assert min(collapsed) > 1000 * max(band), (band, collapsed)
+
+
+def test_collapsed_control_smoke(tmp_path, capsys):
+    """``test_transformer_smoke`` with the control's flags.
+
+    The run finishes, and the log says which model it was: the fused model
+    and its control differ only in the parameter count and the banner line.
+    """
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    out = tmp_path / "run"
+    seen = []
+
+    def record(module, args, output):
+        if isinstance(module, SpatialBlock):
+            seen.append(tuple(args[0].shape))
+
+    handle = torch.nn.modules.module.register_module_forward_hook(record)
+    try:
+        result = main(
+            [
+                "--model", "transformer", "--tokenizer", "collapsed",
+                "--depth-spectral", "0", "--depth-spatial", "8",
+                "--smoke", "--downsample", "1",
+                "--data-root", str(root), "--out-dir", str(out),
+                "--device", "cpu", "--seed", "0",
+            ]
+        )
+    finally:
+        handle.remove()
+    printed = capsys.readouterr().out
+    assert "BandTransformer parameters: 491,191 (0.491M)" in printed
+    assert "tokenizer collapsed" in printed
+    assert "blocks 0+8" in printed
+    assert "transformer  tokenizer collapsed  blocks 0+8  dim 64  heads 4  mlp_ratio 4.0  patch 8" in printed.splitlines()
+    assert seen and all(shape[1:] == (16, 64) for shape in seen)  # (B, N, D) with N = 4 * 4
+    assert result["epochs_ran"] == 1
+    assert result["param_count"] == 491_191
+    with (out / "metrics.jsonl").open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["steps"] == 2
+    # The checkpoint says which tokenizer it holds.
+    last = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    assert last["cfg"]["tokenizer"] == "collapsed"
+    assert "tokenizer.reduce.weight" in last["model"]
+    assert not any("group_emb" in key for key in last["model"])

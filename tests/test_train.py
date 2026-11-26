@@ -617,3 +617,238 @@ def test_checkpoint_save_is_atomic(tmp_path, monkeypatch):
         train_mod._atomic_save({"epoch": 2}, path)
     monkeypatch.undo()
     assert torch.load(path, weights_only=False) == {"epoch": 1}  # the previous checkpoint is whole
+
+
+# --- The band-collapsed control: --tokenizer ---
+
+
+def _parse(*flags):
+    from sw.train import _build_parser
+
+    return config_from_args(_build_parser().parse_args(list(flags)))
+
+
+def test_tokenizer_flag_defaults_to_band_and_builds_the_control():
+    from sw.models.cnn import count_parameters
+    from sw.models.tokenizer import BandTokenizer, CollapsedTokenizer
+    from sw.train import _build_parser, _check_cfg, build_model
+
+    # Default: the band tokenizer with 14 groups, the model as it was.
+    assert _parse().tokenizer == "band"
+    cfg = _parse("--model", "transformer")
+    assert cfg.tokenizer == "band"
+    _check_cfg(cfg)
+    model = build_model(cfg)
+    assert isinstance(model.tokenizer, BandTokenizer)
+    assert model.tokenizer.n_groups == 14
+    assert count_parameters(model) == 488_487
+
+    # The parameter-matched control.
+    cfg = _parse(
+        "--model", "transformer", "--tokenizer", "collapsed", "--depth-spectral", "0", "--depth-spatial", "8"
+    )
+    assert cfg.tokenizer == "collapsed"
+    _check_cfg(cfg)
+    model = build_model(cfg)
+    assert isinstance(model.tokenizer, CollapsedTokenizer)
+    assert (len(model.spectral), len(model.spatial)) == (0, 8)
+    assert count_parameters(model) == 491_191
+
+    with pytest.raises(SystemExit):  # argparse knows the two names only
+        _build_parser().parse_args(["--tokenizer", "pca"])
+    # --pe-init-std says it has no effect with the collapsed tokenizer.
+    pe_help = next(action.help for action in _build_parser()._actions if action.dest == "pe_init_std")
+    assert "No effect with --tokenizer collapsed" in pe_help
+
+
+def test_tokenizer_flag_validation(tmp_path):
+    from sw.train import _check_cfg, build_model
+
+    # collapsed with the default depths: 2 spectral blocks over one group.
+    # The message gives the fix and the matched control.
+    cfg = _parse("--model", "transformer", "--tokenizer", "collapsed")
+    assert cfg.depth_spectral == 2
+    for check in (_check_cfg, build_model):
+        with pytest.raises(ValueError, match="needs --depth-spectral 0, got 2") as raised:
+            check(cfg)
+        assert "matched control is --depth-spectral 0 --depth-spatial 8" in str(raised.value)
+    _check_cfg(_parse("--model", "transformer", "--tokenizer", "collapsed", "--depth-spectral", "0"))  # any spatial depth
+
+    # collapsed is a transformer tokenizer. Without --model transformer the run is the CNN.
+    for flags in (["--tokenizer", "collapsed"], ["--tokenizer", "collapsed", "--depth-spectral", "0", "--depth-spatial", "8"]):
+        cfg = _parse(*flags)
+        assert cfg.model == "cnn"
+        for check in (_check_cfg, build_model):
+            with pytest.raises(ValueError, match="only to --model transformer"):
+                check(cfg)
+
+    # A name set in code (argparse stops it on the command line).
+    for check in (_check_cfg, build_model):
+        with pytest.raises(ValueError, match="tokenizer must be"):
+            check(_cfg(model="transformer", tokenizer="pca"))
+
+    # Through main the refusal comes before any data is read or any folder is made.
+    with pytest.raises(ValueError, match="needs --depth-spectral 0"):
+        main(
+            [
+                "--model", "transformer", "--tokenizer", "collapsed", "--device", "cpu",
+                "--data-root", str(tmp_path / "no-data"), "--out-dir", str(tmp_path / "run"),
+            ]
+        )
+    assert not (tmp_path / "run").exists()
+
+
+def test_a_config_saved_before_the_tokenizer_field_means_band():
+    from dataclasses import asdict
+
+    from sw.models.tokenizer import BandTokenizer
+    from sw.train import TrainConfig, _check_cfg, build_model
+
+    old = asdict(TrainConfig(model="transformer"))
+    del old["tokenizer"]  # what "cfg" in a checkpoint held before this field existed
+    cfg = TrainConfig(**old)
+    assert cfg.tokenizer == "band"
+    _check_cfg(cfg)
+    model = build_model(cfg)
+    assert isinstance(model.tokenizer, BandTokenizer)
+    # The tokenizer's checkpoint keys are the ones older checkpoints hold.
+    assert [key for key in model.state_dict() if key.startswith("tokenizer.")] == [
+        "tokenizer.proj.weight",
+        "tokenizer.proj.bias",
+        "tokenizer.norm.weight",
+        "tokenizer.norm.bias",
+        "tokenizer.group_emb.table.weight",
+    ]
+
+
+def test_banner_line_is_for_transformer_runs_only(tmp_path, capsys):
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    common = ["--smoke", "--downsample", "2", "--data-root", str(root), "--device", "cpu", "--seed", "0"]
+
+    def banner(*flags):
+        capsys.readouterr()
+        main([*common, *flags])
+        lines = capsys.readouterr().out.splitlines()
+        assert any("parameters:" in line for line in lines)
+        return [line for line in lines if line.startswith("transformer ")]
+
+    # A CNN run prints nothing new.
+    assert banner("--out-dir", str(tmp_path / "cnn")) == []
+    # A transformer run names its tokenizer and its block depths, spectral + spatial.
+    assert banner(
+        "--model", "transformer", "--depth-spectral", "1", "--depth-spatial", "2", "--out-dir", str(tmp_path / "band")
+    ) == ["transformer  tokenizer band  blocks 1+2  dim 64  heads 4  mlp_ratio 4.0  patch 8"]
+
+
+def test_tokenizer_collapsed_refuses_a_single_spectral_block_with_the_flag_names():
+    from sw.models.transformer import BandTransformer
+    from sw.train import _check_cfg, build_model
+
+    # One spectral block is refused too, and by the CLI check (flag names),
+    # not only by the model constructor (argument names).
+    cfg = _parse("--model", "transformer", "--tokenizer", "collapsed", "--depth-spectral", "1", "--depth-spatial", "7")
+    for check in (_check_cfg, build_model):
+        with pytest.raises(ValueError, match="needs --depth-spectral 0, got 1") as raised:
+            check(cfg)
+        # 0+8 is matched against the default 2+6 model. The message says which model.
+        assert "default 2+6 model" in str(raised.value)
+    with pytest.raises(ValueError, match="needs depth_spectral=0, got 1") as raised:
+        BandTransformer(1, 7, tokenizer="collapsed")
+    assert "default 2+6 model" in str(raised.value)
+
+
+def test_help_says_what_the_collapsed_tokenizer_ignores_and_where_it_writes():
+    from sw.train import _build_parser
+
+    parser = _build_parser()
+    helps = {action.dest: action.help for action in parser._actions}
+    assert "No effect with --tokenizer collapsed" in helps["group"]
+    # The control and the fused model share the default folder, so the help asks for --out-dir.
+    assert "own --out-dir" in helps["tokenizer"]
+    assert "--tokenizer" in parser.format_help()  # the help text renders
+
+
+def test_banner_names_the_model_that_trains_not_the_config(tmp_path, capsys):
+    from sw.models.transformer import BandTransformer
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+
+    def banner(model, name):
+        cfg = _cfg(
+            model="transformer", data_root=str(root), out_dir=str(tmp_path / name), batch_size=2,
+            downsample=2, max_train_images=2, max_train_steps=1,
+        )
+        assert (cfg.tokenizer, cfg.depth_spectral, cfg.depth_spatial) == ("band", 2, 6)
+        capsys.readouterr()
+        train(model, cfg)
+        return [line for line in capsys.readouterr().out.splitlines() if line.startswith("transformer ")]
+
+    # The config says band 2+6. The line names the model that was passed in.
+    assert banner(BandTransformer(0, 1, tokenizer="collapsed"), "collapsed") == [
+        "transformer  tokenizer collapsed  blocks 0+1  dim 64  heads 4  mlp_ratio 4.0  patch 8"
+    ]
+    # A model object pickled before ``tokenizer=`` existed has no ``tokenizer_kind``
+    # (unpickling does not run ``__init__``). It is a band model, and the run
+    # does not stop at the banner.
+    old = BandTransformer(1, 1)
+    del old.tokenizer_kind
+    assert banner(old, "old") == ["transformer  tokenizer band  blocks 1+1  dim 64  heads 4  mlp_ratio 4.0  patch 8"]
+
+
+def test_control_checkpoint_resumes_only_as_the_control(tmp_path, capsys):
+    """A control checkpoint continues with the control's flags and is refused as a band model.
+
+    ``reduce=16`` gives both tokenizers the same patch conv shape. At the
+    same depths the two models differ in three tokenizer keys and nothing
+    else, so the strict key check in ``load_state_dict`` is all that stops a
+    silent cross-load.
+    """
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    out = tmp_path / "ctl"
+    last = out / "last.pt"
+    common = ["--downsample", "1", "--data-root", str(root), "--device", "cpu", "--out-dir", str(out), "--seed", "0"]
+    depths = ["--model", "transformer", "--depth-spectral", "0", "--depth-spatial", "8"]
+    main([*depths, "--tokenizer", "collapsed", "--smoke", *common])
+    before = last.read_bytes()
+    rows_before = (out / "metrics.jsonl").read_text(encoding="utf-8")
+
+    # The control's depths with the band tokenizer: the key names stop it, not a shape.
+    with pytest.raises(RuntimeError, match="tokenizer.reduce.weight") as raised:
+        main([*depths, "--smoke", *common, "--resume", str(last)])
+    message = str(raised.value)
+    assert "tokenizer.group_emb.table.weight" in message  # missing
+    assert "tokenizer.reduce.bias" in message  # unexpected, with tokenizer.reduce.weight
+    assert "size mismatch" not in message
+    assert "tokenizer.proj" not in message and "spatial." not in message and "head." not in message
+    # The fused defaults.
+    with pytest.raises(RuntimeError, match="group_emb"):
+        main(["--model", "transformer", "--smoke", *common, "--resume", str(last)])
+    # A refused resume writes nothing.
+    assert last.read_bytes() == before
+    assert (out / "metrics.jsonl").read_text(encoding="utf-8") == rows_before
+
+    # With the control's flags it continues at the next epoch.
+    capsys.readouterr()
+    result = main(
+        [
+            *depths, "--tokenizer", "collapsed", *common,
+            "--epochs", "2", "--batch-size", "2", "--num-workers", "0",
+            "--max-train-images", "4", "--max-val-images", "2", "--max-train-steps", "2",
+            "--resume", str(last),
+        ]
+    )
+    printed = capsys.readouterr().out
+    assert "next epoch 2" in printed
+    assert "transformer  tokenizer collapsed  blocks 0+8  dim 64  heads 4  mlp_ratio 4.0  patch 8" in printed.splitlines()
+    assert result["epochs_ran"] == 2
+    assert result["param_count"] == 491_191
+    with (out / "metrics.jsonl").open(encoding="utf-8") as handle:
+        assert [json.loads(line)["epoch"] for line in handle if line.strip()] == [1, 2]
+    resumed = torch.load(last, map_location="cpu", weights_only=False)
+    assert resumed["epoch"] == 2
+    assert resumed["cfg"]["tokenizer"] == "collapsed"
+    assert "tokenizer.reduce.weight" in resumed["model"]

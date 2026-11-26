@@ -29,6 +29,10 @@ Run it from the repo root:
     PYTHONPATH=src python -m sw.train --model transformer --smoke
     PYTHONPATH=src python -m sw.train --epochs 30 --batch-size 4 --out-dir runs/cnn
 
+The band-collapsed control for the fusion claim is the same transformer
+with ``--tokenizer collapsed --depth-spectral 0 --depth-spatial 8``
+(491,191 parameters against 488,487). Give it its own ``--out-dir``.
+
 ``--smoke`` is two optimizer steps on a few images. It is a CPU-friendly
 wiring check. The number it prints is not a result to put on a slide.
 
@@ -112,6 +116,15 @@ class TrainConfig:
     ``head_prior_bias`` sets the SegHead final conv bias to ``log`` train
     class priors (transformer only; default off).
 
+    ``tokenizer`` is ``"band"`` (``BandTokenizer``, the default) or
+    ``"collapsed"`` (``CollapsedTokenizer``: a 1x1 conv mixes all bands
+    before the patch embedding). Transformer only. ``"collapsed"`` needs
+    ``depth_spectral=0``; with ``depth_spatial=8`` it is the
+    parameter-matched control for the default model (491,191 against
+    488,487 parameters; FLOPs and step time are not matched). ``group`` and
+    ``pe_init_std`` have no effect with it. A config saved before this
+    field existed has no ``tokenizer`` entry and means ``"band"``.
+
     Default ``lr`` stays ``1e-3`` for both models. For the transformer on
     raw (non-standardised) cubes, ``3e-4`` is the recommended starting
     point; see ``docs/INPUT-BLIND.md``.
@@ -154,6 +167,7 @@ class TrainConfig:
     stats_path: str | None = None
     pe_init_std: float = 1.0
     head_prior_bias: bool = False
+    tokenizer: str = "band"
 
 
 def resolve_device(name: str) -> torch.device:
@@ -382,6 +396,26 @@ def _has_batchnorm(model: nn.Module) -> bool:
     return any(isinstance(module, nn.modules.batchnorm._BatchNorm) for module in model.modules())
 
 
+def _check_tokenizer(cfg: TrainConfig) -> None:
+    """The ``tokenizer`` rules, worded for the CLI.
+
+    ``_check_cfg`` and ``build_model`` both call this, so ``main`` (which
+    builds the model before ``train`` checks the config) reports a bad
+    combination with the flag names.
+    """
+    if cfg.tokenizer not in ("band", "collapsed"):
+        raise ValueError(f"tokenizer must be 'band' or 'collapsed', got {cfg.tokenizer!r}")
+    if cfg.tokenizer != "band" and cfg.model != "transformer":
+        raise ValueError("--tokenizer applies only to --model transformer")
+    if cfg.tokenizer == "collapsed" and cfg.depth_spectral > 0:
+        raise ValueError(
+            f"--tokenizer collapsed needs --depth-spectral 0, got {cfg.depth_spectral}: with one "
+            "band group a spectral block is a per-token MLP, not attention over bands. "
+            "The parameter-matched control is --depth-spectral 0 --depth-spatial 8 "
+            "(matched against the default 2+6 model)"
+        )
+
+
 def _check_cfg(cfg: TrainConfig) -> None:
     if cfg.epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {cfg.epochs}")
@@ -429,6 +463,7 @@ def _check_cfg(cfg: TrainConfig) -> None:
             raise ValueError(f"pe_init_std must be > 0, got {cfg.pe_init_std}")
     if cfg.head_prior_bias and cfg.model != "transformer":
         raise ValueError("--head-prior-bias applies only to --model transformer")
+    _check_tokenizer(cfg)
 
 
 def _log_mode(path: Path, resume: bool) -> str:
@@ -588,6 +623,16 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     limited = cfg.max_train_steps is not None or cfg.max_train_images is not None
     schedule = "cosine" if scheduler is not None else "constant"
     print(f"{model.__class__.__name__} parameters: {n_params:,} ({n_params / 1e6:.3f}M)")
+    if isinstance(model, BandTransformer):
+        # Read from the model, not cfg, so the log names what is training:
+        # the fused model and its control differ only in this line and the count.
+        # A model object pickled before ``tokenizer=`` existed has no
+        # ``tokenizer_kind``. It can only be the band model.
+        print(
+            f"transformer  tokenizer {getattr(model, 'tokenizer_kind', 'band')}  "
+            f"blocks {model.depth_spectral}+{model.depth_spatial}  dim {model.dim}  "
+            f"heads {model.heads}  mlp_ratio {float(model.mlp_ratio)}  patch {model.patch}"
+        )
     print(
         f"device {device}  epochs {start_epoch}-{cfg.epochs}  batch {cfg.batch_size}  "
         f"lr {cfg.lr}  weight_decay {cfg.weight_decay}  schedule {schedule}  amp {'on' if use_amp else 'off'}"
@@ -802,7 +847,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--group",
         type=int,
         default=16,
-        help="Bands per tokenizer group (transformer). 224 / 16 = 14 groups.",
+        help=(
+            "Bands per tokenizer group (transformer). 224 / 16 = 14 groups. "
+            "No effect with --tokenizer collapsed."
+        ),
+    )
+    parser.add_argument(
+        "--tokenizer",
+        choices=["band", "collapsed"],
+        default="band",
+        help=(
+            "Transformer only. band is BandTokenizer (band-group tokens). collapsed mixes all bands "
+            "with a 1x1 conv before the patch embedding (one group): the band-collapsed control. "
+            "It needs --depth-spectral 0; with --depth-spatial 8 it matches the default model's "
+            "parameters (491,191 against 488,487). --group and --pe-init-std have no effect with it. "
+            "Give the control its own --out-dir: the default, runs/transformer, is the fused model's too."
+        ),
     )
     parser.add_argument("--data-root", default=None, help="Dataset folder. Default: the SW_ROOT environment variable.")
     parser.add_argument("--epochs", type=int, default=30)
@@ -897,7 +957,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pe-init-std",
         type=float,
         default=1.0,
-        help="IndexBandPE init scale (transformer). Default 1.0 matches today's N(0,1). Try 0.02 with --standardize.",
+        help=(
+            "IndexBandPE init scale (transformer). Default 1.0 matches today's N(0,1). "
+            "Try 0.02 with --standardize. No effect with --tokenizer collapsed (it has no IndexBandPE)."
+        ),
     )
     parser.add_argument(
         "--head-prior-bias",
@@ -968,6 +1031,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         stats_path=args.stats_path,
         pe_init_std=args.pe_init_std,
         head_prior_bias=bool(args.head_prior_bias),
+        tokenizer=args.tokenizer,
     )
 
 
@@ -980,7 +1044,12 @@ def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
 
     When ``cfg.head_prior_bias`` is set, the SegHead classifier bias is
     initialised to ``log`` of the hyperspectral train class priors.
+
+    ``cfg.tokenizer`` picks the transformer's tokenizer. A combination
+    ``_check_cfg`` would refuse (``collapsed`` with spectral blocks, or
+    with the CNN) is refused here too, before anything is built.
     """
+    _check_tokenizer(cfg)
     if cfg.model == "cnn":
         return MiniNetSeg(in_channels=in_channels)
     if cfg.model == "transformer":
@@ -995,6 +1064,7 @@ def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
             group=cfg.group,
             patch=cfg.patch,
             pe_init_std=cfg.pe_init_std,
+            tokenizer=cfg.tokenizer,
         )
         if cfg.head_prior_bias:
             init_seg_head_prior_bias(model.head, HYPER_LT_TRAIN_PIXEL_COUNTS)

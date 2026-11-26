@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sw.models.tokenizer import BandTokenizer
+from sw.models.tokenizer import BandTokenizer, CollapsedTokenizer
 from sw.attention import FeedForward, MultiHeadSelfAttention, ResidualSelfAttentionBlock
 from sw.data import HYPER_LT_TRAIN_PIXEL_COUNTS
 
@@ -537,6 +537,30 @@ class BandTransformer(nn.Module):
         group: bands per tokenizer group. Default 16, so ``G = 14``.
         patch: tokenizer kernel and stride, and the head's nominal scale.
             Default 8.
+        pe_init_std: scale of the band tokenizer's group embedding
+            (``IndexBandPE``) after its ``N(0, 1)`` draw. Default 1.0.
+        tokenizer: ``"band"`` (the default) is ``BandTokenizer``, ``G``
+            band groups. ``"collapsed"`` is ``CollapsedTokenizer``: a 1x1
+            conv mixes all the bands before the patch embedding, so
+            ``G = 1``. Any other value raises ``ValueError``.
+
+    The band-collapsed control is ``BandTransformer(0, 8,
+    tokenizer="collapsed")``: "the same backbone with the band axis
+    collapsed first, at matched parameters". Matched means the total of
+    trainable parameters of the whole model: 491,191 against 488,487 for the
+    fused ``BandTransformer(2, 6)``, 0.55% more. FLOPs and step time are not
+    matched. With ``tokenizer="collapsed"``:
+
+    - ``depth_spectral`` must be 0. With one group, attention has a single
+      token to attend to (its weights are all 1), so a spectral block is a
+      per-token map, not attention over bands. The parameter total would
+      not show it: both block types have 49,984 parameters, so 2+6 would
+      also count 491,191 while only 6 blocks do attention.
+    - ``group`` and ``pe_init_std`` have no effect: there are no groups and
+      no ``IndexBandPE``. Passing them is not an error (their range checks
+      still run).
+    - ``forward`` is the same code. The tokens are ``(B, N, 1, D)``, and the
+      mean over one group is the identity.
 
     Input ``(B, n_bands, H, W)`` returns logits ``(B, num_classes, H, W)``.
     """
@@ -553,6 +577,7 @@ class BandTransformer(nn.Module):
         group: int = 16,
         patch: int = 8,
         pe_init_std: float = 1.0,
+        tokenizer: str = "band",
     ):
         super().__init__()
         if depth_spectral < 0 or depth_spatial < 0:
@@ -568,6 +593,15 @@ class BandTransformer(nn.Module):
             raise ValueError(f"group must be >= 1, got {group}")
         if pe_init_std <= 0:
             raise ValueError(f"pe_init_std must be > 0, got {pe_init_std}")
+        if tokenizer not in ("band", "collapsed"):
+            raise ValueError(f"tokenizer must be 'band' or 'collapsed', got {tokenizer!r}")
+        if tokenizer == "collapsed" and depth_spectral > 0:
+            raise ValueError(
+                f"tokenizer='collapsed' needs depth_spectral=0, got {depth_spectral}: with one "
+                "band group a spectral block is a per-token MLP, not attention over bands. "
+                "The parameter-matched control is depth_spectral=0, depth_spatial=8 "
+                "(matched against the default 2+6 model)"
+            )
 
         self.depth_spectral = depth_spectral
         self.depth_spatial = depth_spatial
@@ -577,14 +611,22 @@ class BandTransformer(nn.Module):
         self.num_classes = num_classes
         self.patch = patch
         self.pe_init_std = float(pe_init_std)
+        self.tokenizer_kind = tokenizer
 
-        self.tokenizer = BandTokenizer(
-            n_bands=n_bands,
-            d_model=dim,
-            group=group,
-            patch=patch,
-            pe_init_std=pe_init_std,
-        )
+        # The "band" branch is the constructor call this class always made,
+        # in the same place, so a seed still gives the same weights.
+        if tokenizer == "band":
+            self.tokenizer = BandTokenizer(
+                n_bands=n_bands,
+                d_model=dim,
+                group=group,
+                patch=patch,
+                pe_init_std=pe_init_std,
+            )
+        else:
+            # reduce stays at CollapsedTokenizer's default of 16: that is
+            # what matches the parameter count (see its docstring).
+            self.tokenizer = CollapsedTokenizer(n_bands=n_bands, d_model=dim, patch=patch)
         self.spectral = nn.ModuleList(
             [SpectralBlock(dim, heads, mlp_ratio) for _ in range(depth_spectral)]
         )
