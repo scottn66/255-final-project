@@ -458,6 +458,31 @@ def test_flags_that_change_the_run_are_refused_and_resumable_ones_are_not(tmp_pa
     assert gates.run_identity(["--epochs=3", "--lr", "1e-3", "--device", "cuda"]) == ["--lr", "1e-3"]
 
 
+def test_a_run_started_before_the_recipe_flags_still_resumes(tmp_path):
+    """ARGS.json and last.pt from before --warmup-steps, --clip-grad-norm and
+    --cosine-floor existed: the same flags resume it (the new ones default to
+    off and are not in the identity), and turning one on is a different run."""
+    import torch
+
+    root = _train_root(tmp_path)
+    out = tmp_path / "run"
+    gates.run(out, _args(root, 1))
+    (out / gates.DONE_FILE).unlink()
+    old = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    del old["step"]  # the checkpoint as the harness wrote it before the recipe
+    for name in ("warmup_steps", "clip_grad_norm", "cosine_floor"):
+        del old["cfg"][name]
+    torch.save(old, out / "last.pt")
+    assert not any("warmup" in token or "clip" in token or "floor" in token for token in json.loads((out / gates.ARGS_FILE).read_text()))
+
+    with pytest.raises(ValueError, match="different flags"):
+        gates.run(out, [*_args(root, 2), "--clip-grad-norm", "1.0"])
+    done = gates.run(out, _args(root, 2))
+    assert done["resumed"] is True and done["result"]["epochs_ran"] == 2
+    assert [r["epoch"] for r in gates.read_metrics(out / "metrics.jsonl")] == [1, 2]
+    assert "grad_norm_max" not in gates.read_metrics(out / "metrics.jsonl")[-1]
+
+
 def test_resume_drops_log_rows_written_after_the_checkpoint(tmp_path):
     root = _train_root(tmp_path)
     out = tmp_path / "run"
@@ -526,3 +551,48 @@ def test_cli_and_background_launch(tmp_path):
     _hold(live, pid=os.getppid())
     assert gates.launch(live, _args(root, 1), env=_env()) is None  # never a second copy
     assert not (live / "train.log").exists()
+
+
+def test_recipe_flags_are_part_of_the_run_and_a_resume_keeps_them(tmp_path, monkeypatch):
+    """A run started with the recipe flags: ARGS.json holds them, the same
+    flags resume it with the warmup where it stopped, and a changed or
+    dropped recipe flag is a different run."""
+    import torch
+
+    root = _train_root(tmp_path)
+    out = tmp_path / "run"
+    recipe = ["--warmup-steps", "3", "--clip-grad-norm", "1.0"]
+    assert gates.run_identity([*_args(root, 1), *recipe])[-4:] == recipe
+
+    rates = []
+    real = torch.optim.AdamW.step
+
+    def step(self, *args, **kwargs):
+        rates.append(self.param_groups[0]["lr"])
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", step)
+    gates.run(out, [*_args(root, 1), *recipe])
+    assert json.loads((out / gates.ARGS_FILE).read_text())[-4:] == recipe
+    (out / gates.DONE_FILE).unlink()  # as if the session died after epoch 1
+
+    for changed in (
+        _args(root, 2),  # the recipe dropped
+        [*_args(root, 2), "--warmup-steps", "3"],  # one flag dropped
+        [*_args(root, 2), "--warmup-steps", "4", "--clip-grad-norm", "1.0"],  # a value changed
+        [*_args(root, 2), *recipe, "--cosine-floor", "0.01"],  # one added
+    ):
+        with pytest.raises(ValueError, match="different flags"):
+            gates.run(out, changed)
+    assert len(rates) == 2  # a refused call trains nothing
+
+    done = gates.run(out, [*_args(root, 2), *recipe])
+    assert done["resumed"] is True and done["result"]["epochs_ran"] == 2
+    # Two steps per epoch at a constant rate: the ramp ends on the first step after the resume.
+    assert rates == pytest.approx([1e-3 / 3, 2e-3 / 3, 1e-3, 1e-3], rel=1e-9)
+    rows = gates.read_metrics(out / "metrics.jsonl")
+    assert [r["epoch"] for r in rows] == [1, 2]
+    assert all(r["grad_norm_max"] > 0 for r in rows)
+    last = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    assert last["step"] == 4
+    assert (last["cfg"]["warmup_steps"], last["cfg"]["clip_grad_norm"]) == (3, 1.0)

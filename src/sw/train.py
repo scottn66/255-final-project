@@ -14,6 +14,13 @@ Each ``metrics.jsonl`` row also has the training-set FG mIoU and per-class
 IoU of that epoch and its wall time; ``metrics.csv`` keeps its original
 columns so older runs can still be resumed.
 
+The optimiser recipe is three flags, all off by default: ``--warmup-steps``
+(linear warmup, counted in optimizer steps), ``--clip-grad-norm`` (clip the
+global gradient norm before each step) and ``--cosine-floor`` (the cosine
+schedule stops at that fraction of ``--lr``, not at 0). Why: on four real
+cubes at a constant learning rate with no clipping, one seed's loss jumped
+from 0.10 to 1.13 near epoch 550 (``sw.gates``).
+
 The overfit-one-batch check (no augmentation, 4 training cubes that hold
 all six object classes, linked into a small root by
 ``sw.gates.build_subset_root``; the pass rule is ``sw.gates.judge_overfit``
@@ -98,6 +105,32 @@ class TrainConfig:
     ignored and a line is printed. ``resume`` is a ``last.pt`` path; training
     continues at the next epoch and the metrics files are appended.
 
+    ``warmup_steps`` (W) ramps the learning rate linearly over the first W
+    optimizer steps of the run: step k (counting from 1) uses the scheduled
+    rate times ``min(1, k / W)``. The scheduled rate is ``lr``, or with
+    ``cosine`` the cosine value of the current epoch, so the two multiply:
+    cosine moves once per epoch, warmup once per step. ``0`` is no warmup.
+    The step count is stored in ``last.pt``, so a resume continues the ramp.
+
+    ``clip_grad_norm`` (C) rescales the gradient of all parameters to a
+    global L2 norm of at most C before each optimizer step
+    (``torch.nn.utils.clip_grad_norm_``). ``None`` is no clipping. With it
+    on, each ``metrics.jsonl`` row has ``grad_norm_max``, the largest
+    finite norm of the epoch before clipping (``null`` if there was none),
+    and ``grad_nonfinite_steps``, the number of steps whose norm was NaN
+    or infinite.
+
+    ``cosine_floor`` (F) is the lowest point of the cosine schedule as a
+    fraction of ``lr`` (``eta_min = lr * F``). ``0`` anneals to zero. It
+    bounds the schedule, not the warmup ramp, and does nothing without
+    ``cosine``. The last epoch trains just above the floor; the floor is
+    the rate after it.
+
+    A resume keeps the cosine schedule stored in ``last.pt``. A different
+    floor is refused. A larger ``epochs`` prints a warning: the schedule
+    keeps its old length and the rate climbs back up after it, so fix
+    ``epochs`` once for a cosine run.
+
     ``model`` is ``"cnn"`` (``MiniNetSeg``) or ``"transformer"``
     (``BandTransformer``). The depth, width, head, MLP, patch, and group
     fields size the transformer. A CNN run stores them and leaves them unused.
@@ -168,6 +201,9 @@ class TrainConfig:
     pe_init_std: float = 1.0
     head_prior_bias: bool = False
     tokenizer: str = "band"
+    warmup_steps: int = 0
+    clip_grad_norm: float | None = None
+    cosine_floor: float = 0.0
 
 
 def resolve_device(name: str) -> torch.device:
@@ -436,6 +472,12 @@ def _check_cfg(cfg: TrainConfig) -> None:
         value = getattr(cfg, name)
         if value is not None and value < 1:
             raise ValueError(f"{name} must be >= 1, got {value}")
+    if cfg.warmup_steps < 0:
+        raise ValueError(f"warmup_steps must be >= 0, got {cfg.warmup_steps}")
+    if cfg.clip_grad_norm is not None and not cfg.clip_grad_norm > 0:
+        raise ValueError(f"clip_grad_norm must be > 0 (leave it unset for no clipping), got {cfg.clip_grad_norm}")
+    if not 0.0 <= cfg.cosine_floor <= 1.0:
+        raise ValueError(f"cosine_floor must be between 0 and 1, got {cfg.cosine_floor}")
     if cfg.resume is not None and not Path(cfg.resume).is_file():
         raise FileNotFoundError(f"resume checkpoint does not exist: {cfg.resume}")
     if cfg.model not in ("cnn", "transformer"):
@@ -485,13 +527,24 @@ def _atomic_save(payload, path) -> None:
     os.replace(tmp, path)
 
 
-def _save_last(path, model, optimizer, scheduler, scaler, epoch, best, best_epoch, stall, cfg, weights, use_amp):
-    """Resume checkpoint. ``best.pt`` stays the best weights only."""
+def _warmup_factor(step: int, warmup_steps: int) -> float:
+    """What optimizer step ``step`` (counting from 1) multiplies the scheduled rate by."""
+    if warmup_steps < 1:
+        return 1.0
+    return min(1.0, step / warmup_steps)
+
+
+def _save_last(path, model, optimizer, scheduler, scaler, epoch, step, best, best_epoch, stall, cfg, weights, use_amp):
+    """Resume checkpoint. ``best.pt`` stays the best weights only.
+
+    ``step`` is the number of optimizer steps taken so far, for the warmup.
+    """
     payload = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": None if scheduler is None else scheduler.state_dict(),
         "epoch": epoch,
+        "step": step,
         "best_val_fg_miou": None if best_epoch is None else best,
         "best_epoch": best_epoch,
         "stall": stall,
@@ -515,13 +568,31 @@ def _load_resume(path, model, optimizer, scheduler, scaler, device, use_amp) -> 
             f"{path} has weights but no optimizer. Resume from last.pt "
             "(best.pt is the best weights only)."
         )
+    saved_schedule = ckpt.get("scheduler") if scheduler is not None else None
+    if saved_schedule is not None:
+        # The restored scheduler keeps the floor and the length it was saved
+        # with. Check both against this run's flags before anything is loaded.
+        asked_floor, saved_floor = float(scheduler.eta_min), float(saved_schedule.get("eta_min", 0.0))
+        if not math.isclose(asked_floor, saved_floor, rel_tol=1e-9, abs_tol=1e-15):
+            raise ValueError(
+                f"{path} was trained with a cosine floor of {saved_floor:g} (learning rate); "
+                f"--lr times --cosine-floor is now {asked_floor:g}. A resume keeps the saved schedule, "
+                "so pass the same --lr and --cosine-floor, or start a new run."
+            )
+        asked_epochs, saved_epochs = int(scheduler.T_max), int(saved_schedule.get("T_max", scheduler.T_max))
+        if asked_epochs > saved_epochs:
+            print(
+                f"WARNING: {path} holds a cosine schedule {saved_epochs} epochs long and --epochs is {asked_epochs}. "
+                f"The schedule keeps its length: after epoch {saved_epochs} the learning rate climbs back up. "
+                "To train longer with cosine, start a new run with the larger --epochs."
+            )
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is None:
         if ckpt.get("scheduler") is not None:
             print("cosine is off for this run; not restoring the scheduler")
-    elif ckpt.get("scheduler") is not None:
-        scheduler.load_state_dict(ckpt["scheduler"])
+    elif saved_schedule is not None:
+        scheduler.load_state_dict(saved_schedule)
     else:
         print("checkpoint has no scheduler; cosine restarts from the base learning rate")
     if use_amp and scaler is not None and ckpt.get("scaler"):
@@ -541,8 +612,16 @@ def _load_resume(path, model, optimizer, scheduler, scaler, device, use_amp) -> 
         f"resumed {path}  finished epoch {finished}  "
         f"next epoch {finished + 1}  best val FG mIoU {shown}"
     )
+    if ckpt.get("step") is not None:
+        step = int(ckpt["step"])
+    else:
+        # A last.pt written before the harness counted optimizer steps.
+        # AdamW keeps its own count per parameter; it is the same number.
+        counts = [slot["step"] for slot in optimizer.state_dict()["state"].values() if "step" in slot]
+        step = max((int(value.item() if torch.is_tensor(value) else value) for value in counts), default=0)
     return {
         "start_epoch": finished + 1,
+        "step": step,
         "best": best,
         "best_epoch": best_epoch,
         "stall": int(ckpt.get("stall", 0)),
@@ -601,7 +680,12 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = None
     if cfg.cosine:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+        # cosine_floor 0.0 gives eta_min 0.0, which is the scheduler's own default.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.epochs, eta_min=cfg.lr * cfg.cosine_floor
+        )
+    elif cfg.cosine_floor > 0:
+        print("cosine_floor applies to the cosine schedule only; cosine is off, so it is ignored")
     use_amp = bool(cfg.amp) and device.type == "cuda"
     if cfg.amp and not use_amp:
         print(f"amp applies to cuda only; device is {device.type}, training in full precision")
@@ -612,9 +696,11 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     best_epoch = None
     stall = 0
     start_epoch = 1
+    global_step = 0  # optimizer steps taken over the whole run, resumes included
     if cfg.resume:
         restored = _load_resume(cfg.resume, model, optimizer, scheduler, scaler, device, use_amp)
         start_epoch = restored["start_epoch"]
+        global_step = restored["step"]
         best = restored["best"]
         best_epoch = restored["best_epoch"]
         stall = restored["stall"]
@@ -622,6 +708,9 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     n_params = count_parameters(model)
     limited = cfg.max_train_steps is not None or cfg.max_train_images is not None
     schedule = "cosine" if scheduler is not None else "constant"
+    if scheduler is not None and cfg.cosine_floor > 0:
+        schedule += f" (floor {cfg.lr * cfg.cosine_floor:.6g})"
+    clip_shown = "off" if cfg.clip_grad_norm is None else f"{cfg.clip_grad_norm:g}"
     print(f"{model.__class__.__name__} parameters: {n_params:,} ({n_params / 1e6:.3f}M)")
     if isinstance(model, BandTransformer):
         # Read from the model, not cfg, so the log names what is training:
@@ -637,6 +726,8 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
         f"device {device}  epochs {start_epoch}-{cfg.epochs}  batch {cfg.batch_size}  "
         f"lr {cfg.lr}  weight_decay {cfg.weight_decay}  schedule {schedule}  amp {'on' if use_amp else 'off'}"
     )
+    if cfg.warmup_steps > 0 or cfg.clip_grad_norm is not None:
+        print(f"warmup steps {cfg.warmup_steps} (done {min(global_step, cfg.warmup_steps)})  clip grad norm {clip_shown}")
     print(
         f"train images {len(train_ds)}  val images {len(val_ds)}  "
         f"downsample {cfg.downsample}  crop {cfg.crop_size}  "
@@ -677,6 +768,13 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
             # the weights by up to one epoch, and with dropout or drop path
             # on they read low. No extra forward pass; counted on the device.
             train_counts = torch.zeros(NUM_CLASSES**2, dtype=torch.long, device=device)
+            # The rate the schedule set for this epoch. Warmup scales it per
+            # step and never writes it back: CosineAnnealingLR computes the
+            # next epoch's rate from the one it finds in the optimizer.
+            scheduled_lrs = [group["lr"] for group in optimizer.param_groups]
+            # Before clipping, over the steps with a finite norm; read once per epoch.
+            grad_norm_max = torch.zeros((), device=device)
+            grad_nonfinite = torch.zeros((), dtype=torch.long, device=device)
             epoch_start = time.perf_counter()
             for cubes, masks in train_loader:
                 if needs_two and cubes.shape[0] < 2:
@@ -692,8 +790,24 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                     loss = criterion(logits, masks)
                 _count_pairs(train_counts, logits.detach(), masks)
                 scaler.scale(loss).backward()
+                if cfg.warmup_steps > 0:
+                    factor = _warmup_factor(global_step + 1, cfg.warmup_steps)
+                    for group, scheduled in zip(optimizer.param_groups, scheduled_lrs):
+                        group["lr"] = scheduled * factor
+                if cfg.clip_grad_norm is not None:
+                    # Under --amp the gradients are still scaled; clip the real ones.
+                    # unscale_ is a no-op when the scaler is off (cpu, mps, no --amp).
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm)
+                    # A NaN or inf norm is counted, not kept: under --amp GradScaler
+                    # skips such a step, and one of them should not hide the rest.
+                    grad_norm = torch.as_tensor(grad_norm, device=device).detach().float()
+                    finite = torch.isfinite(grad_norm)
+                    grad_norm_max = torch.where(finite, torch.maximum(grad_norm_max, grad_norm), grad_norm_max)
+                    grad_nonfinite += (~finite).long()
                 scaler.step(optimizer)
                 scaler.update()
+                global_step += 1
                 loss_sum += float(loss.item()) * cubes.shape[0]
                 seen += cubes.shape[0]
                 steps += 1
@@ -718,6 +832,11 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 "train_seconds": round(train_seconds, 3),  # the training pass
                 "epoch_seconds": round(time.perf_counter() - epoch_start, 3),  # training + validation
             }
+            if cfg.clip_grad_norm is not None:
+                nonfinite = int(grad_nonfinite.item())
+                # null when no step of the epoch had a finite norm, like val_fg_miou.
+                record["grad_norm_max"] = None if nonfinite >= steps else float(grad_norm_max.item())
+                record["grad_nonfinite_steps"] = nonfinite
             jsonl_file.write(json.dumps(record) + "\n")
             jsonl_file.flush()
             row = {
@@ -760,6 +879,10 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 print(f"saved {out_dir / 'best.pt'}  (epoch {epoch}, val FG mIoU {score:.4f})")
             else:
                 stall += 1
+            if cfg.warmup_steps > 0:
+                # Hand the schedule back its own rate (see scheduled_lrs above).
+                for group, scheduled in zip(optimizer.param_groups, scheduled_lrs):
+                    group["lr"] = scheduled
             if scheduler is not None:
                 scheduler.step()
             _save_last(
@@ -769,6 +892,7 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 scheduler,
                 scaler,
                 epoch,
+                global_step,
                 best,
                 best_epoch,
                 stall,
@@ -930,6 +1054,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Constant learning rate. The default is CosineAnnealingLR over --epochs.",
     )
     parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help=(
+            "Linear warmup over the first W optimizer steps (not epochs): step k uses "
+            "the scheduled rate times min(1, k / W). Default 0, no warmup."
+        ),
+    )
+    parser.add_argument(
+        "--clip-grad-norm",
+        type=float,
+        default=None,
+        help="Clip the global gradient norm of all parameters to this value before each step. Default: no clipping.",
+    )
+    parser.add_argument(
+        "--cosine-floor",
+        type=float,
+        default=0.0,
+        help="With cosine on, the learning rate never falls below --lr times this. Default 0, anneal to zero.",
+    )
+    parser.add_argument(
         "--amp",
         action="store_true",
         help="Mixed precision on CUDA (autocast + GradScaler). Ignored on cpu and mps.",
@@ -1032,6 +1177,9 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         pe_init_std=args.pe_init_std,
         head_prior_bias=bool(args.head_prior_bias),
         tokenizer=args.tokenizer,
+        warmup_steps=args.warmup_steps,
+        clip_grad_norm=args.clip_grad_norm,
+        cosine_floor=args.cosine_floor,
     )
 
 
