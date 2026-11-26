@@ -63,9 +63,9 @@ class CollapsedTokenizer(nn.Module):
     ``reduce=16`` is deliberate. The patch conv then has the same shape as
     the band tokenizer's (16 -> 64), and the control model is matched on
     parameters: ``BandTransformer(0, 8, tokenizer="collapsed")`` has 491,191
-    against 488,487 for ``BandTransformer(2, 6)``. ``docs/RECIPE.md``
-    mentions 224 -> 32; that control would be about 15% over the fused
-    model. Only the parameter total is matched. FLOPs and step time are not.
+    against 488,487 for ``BandTransformer(2, 6)``. With 224 -> 32 the
+    control would have 560,327, about 15% over the fused model. Only the
+    parameter total is matched. FLOPs and step time are not.
     Token scale is not matched either: at init the tokens that go into
     ``SpatialPE`` have RMS 1.0 here, and they vary about 3 to 4 times as
     much from patch to patch as the band path's pooled tokens (the mean

@@ -17,7 +17,7 @@
 | Input norm | per-band z-score from **train** stats | none (raw [0,1], as in repo) | [J] |
 | Band-group size *g* | **16 bands/token → G = 14 spectral tokens** (≈57 nm each) | {8, 16, 32} | [E] grouping precedent (SpectralFormer, SatMAE); size is [J] |
 | Spatial patch *P* | **8×8 → 32×32 = 1024 patch tokens** | {8, 16}; 4 only with SR-attention | [J], from the compute math in §1 |
-| Tokenizer | shared linear patch-embed per band group (`Conv2d(g→D, k=P, s=P)` applied to each group) | 1×1-conv 224→32 reduction, then same backbone; PCA-3 control | [E] ViT patch embed; ChannelViT shared per-channel embed |
+| Tokenizer | shared linear patch-embed per band group (`Conv2d(g→D, k=P, s=P)` applied to each group) | 1×1-conv 224→16 reduction (`--tokenizer collapsed`, 0 spectral + 8 spatial blocks), then same backbone; PCA-3 control | [E] ViT patch embed; ChannelViT shared per-channel embed |
 | Encoder | **2 spectral blocks** (attention over the G group tokens inside each patch) → mean-pool over G → **6 spatial blocks** (attention over the 1024 patch tokens) | spectral {1,2}, spatial {4,6} | [J] factorized design (TimeSformer/axial precedent) |
 | Width / heads / MLP | **D = 64, 4 heads, MLP ratio 4, pre-LN** | D {64, 96}; heads {2, 4}; ratio {2, 4} | [E] SSFT uses D=64, 4 heads; ratio 4 per ViT/SegFormer |
 | Params | **≈0.49 M** (table in §2) | stay ≤ ~0.6 M; report the count | [E] SSFT 0.516 M, MiniNet HYPER 0.585 M |
@@ -72,7 +72,7 @@ The repo loads **no pretrained weights** for SegFormer or MiniNet (the `init_wei
 
 \*Our own formula estimate for D=64, 2+6 blocks, counting FLOPs as 2×MACs (the paper measured with `torch.profiler`). Reference points: SegFormer-B0 HYPER 6.35, MiniNet HYPER 3.43. **This matters for Phase 3 latency:** P=16 drops the default to ~3.9 GFLOPs.
 
-**Reduce first? [E].** PCA-3 barely hurt SegFormer-B0 in the paper (HYPER3 53.5 vs HYPER 54.3; MiniNet 49.0 vs 52.8). Keep PCA-3 or a learned 1×1 conv (224→32) as a **control**, not the default, because band tokens are the Phase-1 deliverable. Gotchas: `hyper_pca3/` is **not in the Zenodo zip**. `dim_reduction.py` fits PCA on the first 100 files from an *unsorted* `iterdir()`, and by default its scores are not normalized. If you build it, sort the files, fit on train only, and standardize.
+**Reduce first? [E].** PCA-3 barely hurt SegFormer-B0 in the paper (HYPER3 53.5 vs HYPER 54.3; MiniNet 49.0 vs 52.8). Keep PCA-3 or a learned 1×1 conv (224→16) as a **control**, not the default, because band tokens are the Phase-1 deliverable. The control is built with 224→16, not 32: `CollapsedTokenizer` with 0 spectral + 8 spatial blocks has 491,191 parameters against 488,487 for the fused model. With 224→32 it would have 560,327, 14.7% more. Gotchas: `hyper_pca3/` is **not in the Zenodo zip**. `dim_reduction.py` fits PCA on the first 100 files from an *unsorted* `iterdir()`, and by default its scores are not normalized. If you build it, sort the files, fit on train only, and standardize.
 
 **Patch size and resolution [J].** Keep the native 256², because the thin classes (video_tape, filament) vanish when downsampled. At P=8 the spatial sequence is 1024 tokens. Attention there costs about 4 MB per image per layer in fp16 at 2–4 heads, so batch 8 fits on a 16 GB T4. P=4 (4096 tokens, 16× the attention memory) needs SegFormer-style spatial-reduction attention (R=4) or windows. P=16 is the cheap or Phase-3-friendly option. Expect it to cost thin-class IoU unless the decoder skip is kept.
 
@@ -155,7 +155,7 @@ Train pixels in `labels_hyper_lt` (TEAM-PLAN/P0): bg 81.97%, film 5.40%, basket 
    │    b. CE weight exp 0.12→0.5; then Lovász fine-tune or focal γ=2
    └─ UNSTABLE (spikes/NaN, val swings > ±5):
         lower LR, warmup 10, fp32 softmax, QK-LayerNorm [Dehghani et al.], confirm pre-LN
-2. Tokenizer check: same backbone on a 1×1-conv 224→32 reduction (or PCA-3).
+2. Tokenizer check: same backbone on a 1×1-conv 224→16 reduction (or PCA-3). 16, not 32, keeps the parameters matched (§1).
    If reduction beats band tokens by > 2 pts → band grouping is the bottleneck: try g = 8 / 32. Report it honestly.
 3. Stop rule (~Nov 1): freeze the best run and report the honest gap (TEAM-PLAN: < 52.8 is normal).
    The locality fixes carry into Phase 2 as SSFT's spatial-conv branch.
