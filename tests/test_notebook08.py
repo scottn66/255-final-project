@@ -1,4 +1,8 @@
-"""notebooks/08_screen_three_arms.ipynb: valid, no stored outputs, and its flags build the three models."""
+"""notebooks/08_screen_three_arms.ipynb: valid, and its flags build the three models.
+
+The notebook is committed with the outputs of its Colab run. They are the
+record of that run, so no test asks for them to be empty.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ def settings(monkeypatch):
     return names
 
 
-def test_notebook_is_valid_and_has_no_outputs():
+def test_notebook_is_valid():
     nb = _notebook()
     assert nb["nbformat"] == 4
     assert nb["cells"]
@@ -47,8 +51,8 @@ def test_notebook_is_valid_and_has_no_outputs():
         assert cell["cell_type"] in ("markdown", "code")
         assert isinstance(cell["source"], list)
         if cell["cell_type"] == "code":
-            assert cell["outputs"] == []
-            assert cell["execution_count"] is None
+            # Outputs stay: they are the record of the run.
+            assert isinstance(cell["outputs"], list)
             ast.parse("".join(cell["source"]))
     badge = "".join(nb["cells"][0]["source"])
     # The badge opens the file on the branch the Settings cell clones.
