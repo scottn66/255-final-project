@@ -57,6 +57,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -125,6 +126,23 @@ class TrainConfig:
     bounds the schedule, not the warmup ramp, and does nothing without
     ``cosine``. The last epoch trains just above the floor; the floor is
     the rate after it.
+
+    Long runs over several sessions (``docs/COLAB.md``), all off by default:
+    ``save_every`` (N) writes ``last.pt`` every N epochs and always on the
+    last epoch or a stop; ``keep_last`` (K) also keeps the K newest
+    ``ckpt_eNNNNN.pt`` copies of it. ``eval_every`` (N) validates every N
+    epochs (and on the last and a stop); other epochs log ``val_fg_miou``
+    null, and ``patience`` counts validations. ``max_minutes`` stops cleanly,
+    after a saved epoch, once another epoch would not fit in that many
+    minutes from the start of this call; the result then has
+    ``stopped: "time_budget"`` and a later ``--resume`` carries on.
+    ``last.pt`` also holds the RNG states (python, numpy, torch, cuda and the
+    train loader's shuffle), restored on resume.
+
+    ``init_from`` starts a NEW run (epoch 1, fresh schedule and warmup) from the
+    weights in that checkpoint; ``init_optimizer`` also takes its AdamW
+    moments, with this run's ``lr`` and ``weight_decay``. A ``resume`` wins
+    over it. This is how a variant forks from another run's state.
 
     A resume keeps the cosine schedule stored in ``last.pt``. A different
     floor is refused. A larger ``epochs`` prints a warning: the schedule
@@ -204,6 +222,12 @@ class TrainConfig:
     warmup_steps: int = 0
     clip_grad_norm: float | None = None
     cosine_floor: float = 0.0
+    save_every: int = 1
+    keep_last: int = 0
+    eval_every: int = 1
+    max_minutes: float | None = None
+    init_from: str | None = None
+    init_optimizer: bool = False
 
 
 def resolve_device(name: str) -> torch.device:
@@ -480,6 +504,17 @@ def _check_cfg(cfg: TrainConfig) -> None:
         raise ValueError(f"cosine_floor must be between 0 and 1, got {cfg.cosine_floor}")
     if cfg.resume is not None and not Path(cfg.resume).is_file():
         raise FileNotFoundError(f"resume checkpoint does not exist: {cfg.resume}")
+    if cfg.save_every < 1 or cfg.eval_every < 1 or cfg.keep_last < 0:
+        raise ValueError(
+            f"save_every and eval_every must be >= 1 and keep_last >= 0, got "
+            f"{cfg.save_every}, {cfg.eval_every}, {cfg.keep_last}"
+        )
+    if cfg.max_minutes is not None and not cfg.max_minutes > 0:
+        raise ValueError(f"max_minutes must be > 0 (leave it unset for no limit), got {cfg.max_minutes}")
+    if cfg.init_from is not None and not Path(cfg.init_from).is_file():
+        raise FileNotFoundError(f"init checkpoint does not exist: {cfg.init_from}")
+    if cfg.init_optimizer and cfg.init_from is None:
+        raise ValueError("--init-optimizer needs --init-from")
     if cfg.model not in ("cnn", "transformer"):
         raise ValueError(f"model must be 'cnn' or 'transformer', got {cfg.model!r}")
     if cfg.model == "transformer":
@@ -534,7 +569,61 @@ def _warmup_factor(step: int, warmup_steps: int) -> float:
     return min(1.0, step / warmup_steps)
 
 
-def _save_last(path, model, optimizer, scheduler, scaler, epoch, step, best, best_epoch, stall, cfg, weights, use_amp):
+def _rng_state(loader) -> dict:
+    """Every RNG a resume must continue, so a resumed run draws what an unbroken one would."""
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "loader": loader.generator.get_state(),
+    }
+    return state
+
+
+def _restore_rng(state, loader) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+    loader.generator.set_state(state["loader"].cpu())
+
+
+def _snapshot(out_dir: Path, epoch: int, keep: int) -> None:
+    """Copy ``last.pt`` to ``ckpt_eNNNNN.pt`` (atomically) and keep only the ``keep`` newest."""
+    target = out_dir / f"ckpt_e{epoch:05d}.pt"
+    tmp = target.with_name(target.name + ".tmp")
+    shutil.copyfile(out_dir / "last.pt", tmp)
+    os.replace(tmp, target)
+    for old in sorted(out_dir.glob("ckpt_e*.pt"))[:-keep]:
+        old.unlink()
+
+
+def _init_from(cfg, model, optimizer, scheduler, device) -> None:
+    """Weights (and with ``init_optimizer`` the AdamW moments) of another run; everything else is new."""
+    ckpt = torch.load(cfg.init_from, map_location=device, weights_only=False)
+    if "model" not in ckpt:
+        raise KeyError(f"{cfg.init_from} has no 'model'")
+    model.load_state_dict(ckpt["model"])
+    if cfg.init_optimizer:
+        if "optimizer" not in ckpt:
+            raise KeyError(f"{cfg.init_from} has no optimizer; use a last.pt or ckpt_e*.pt, not best.pt")
+        optimizer.load_state_dict(ckpt["optimizer"])
+        # The loaded groups carry the parent's rates; this run's flags win.
+        for group in optimizer.param_groups:
+            group.update(lr=cfg.lr, initial_lr=cfg.lr, weight_decay=cfg.weight_decay)
+        if scheduler is not None:
+            scheduler.base_lrs = [cfg.lr] * len(optimizer.param_groups)
+    print(
+        f"init from {cfg.init_from}  (parent epoch {ckpt.get('epoch')}, "
+        f"optimizer {'taken' if cfg.init_optimizer else 'fresh'})"
+    )
+
+
+def _save_last(
+    path, model, optimizer, scheduler, scaler, epoch, step, best, best_epoch, stall, cfg, weights, use_amp, rng=None
+):
     """Resume checkpoint. ``best.pt`` stays the best weights only.
 
     ``step`` is the number of optimizer steps taken so far, for the warmup.
@@ -552,6 +641,8 @@ def _save_last(path, model, optimizer, scheduler, scaler, epoch, step, best, bes
         "class_weights": [float(value) for value in weights.detach().cpu().tolist()],
         "cfg": asdict(cfg),
     }
+    if rng is not None:
+        payload["rng"] = rng
     if use_amp:
         payload["scaler"] = scaler.state_dict()
     _atomic_save(payload, path)
@@ -625,6 +716,7 @@ def _load_resume(path, model, optimizer, scheduler, scaler, device, use_amp) -> 
         "best": best,
         "best_epoch": best_epoch,
         "stall": int(ckpt.get("stall", 0)),
+        "rng": ckpt.get("rng"),
     }
 
 
@@ -638,6 +730,7 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
     crops, and shuffle follow ``cfg.seed`` on their own.
     """
     _check_cfg(cfg)
+    call_start = time.perf_counter()
     # BatchNorm (the CNN) needs 2 or more images per training batch. The
     # check reads the model too, so a BatchNorm model is caught whatever
     # cfg.model says, before any data is read or any folder is made.
@@ -704,6 +797,10 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
         best = restored["best"]
         best_epoch = restored["best_epoch"]
         stall = restored["stall"]
+        if restored["rng"] is not None:
+            _restore_rng(restored["rng"], train_loader)
+    elif cfg.init_from:
+        _init_from(cfg, model, optimizer, scheduler, device)
 
     n_params = count_parameters(model)
     limited = cfg.max_train_steps is not None or cfg.max_train_images is not None
@@ -749,9 +846,15 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
 
     fieldnames = ["epoch", "train_loss", "val_fg_miou", "steps", *[f"iou_{name}" for name in CLASS_NAMES]]
     epochs_ran = start_epoch - 1
+    if cfg.resume:
+        # last.pt can be older than the log (--save-every, or a kill between the two writes).
+        from sw.gates import _trim_logs
+
+        _trim_logs(out_dir, start_epoch - 1)
     jsonl_mode = _log_mode(jsonl_path, cfg.resume is not None)
     csv_mode = _log_mode(csv_path, cfg.resume is not None)
 
+    stopped = None
     with jsonl_path.open(jsonl_mode, encoding="utf-8") as jsonl_file, csv_path.open(
         csv_mode, newline="", encoding="utf-8"
     ) as csv_file:
@@ -759,6 +862,7 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
         if csv_mode == "w":
             writer.writeheader()
         for epoch in range(start_epoch, cfg.epochs + 1):
+            stopped = None
             model.train()
             loss_sum = 0.0
             seen = 0
@@ -819,7 +923,16 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
             train_cm = train_counts.cpu().numpy().reshape(NUM_CLASSES, NUM_CLASSES)  # the one copy per epoch
             train_seconds = time.perf_counter() - epoch_start
             train_score, train_iou = fg_miou_from_cm(train_cm)
-            score, per_class = _evaluate(model, val_loader, device)
+            # Stop after this epoch when another would not fit in --max-minutes.
+            out_of_time = (
+                cfg.max_minutes is not None
+                and time.perf_counter() - call_start + 1.3 * train_seconds > cfg.max_minutes * 60
+            )
+            evaluated = epoch % cfg.eval_every == 0 or epoch == cfg.epochs or out_of_time
+            if evaluated:
+                score, per_class = _evaluate(model, val_loader, device)
+            else:
+                score, per_class = math.nan, {name: None for name in CLASS_NAMES}
             epochs_ran = epoch
             record = {
                 "epoch": epoch,
@@ -859,7 +972,7 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                 f"{record['epoch_seconds']:.1f}s"
             )
 
-            improved = math.isfinite(score) and score > best
+            improved = evaluated and math.isfinite(score) and score > best
             if improved:
                 best = score
                 best_epoch = epoch
@@ -877,7 +990,7 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                     out_dir / "best.pt",
                 )
                 print(f"saved {out_dir / 'best.pt'}  (epoch {epoch}, val FG mIoU {score:.4f})")
-            else:
+            elif evaluated:
                 stall += 1
             if cfg.warmup_steps > 0:
                 # Hand the schedule back its own rate (see scheduled_lrs above).
@@ -885,26 +998,40 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
                     group["lr"] = scheduled
             if scheduler is not None:
                 scheduler.step()
-            _save_last(
-                out_dir / "last.pt",
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                global_step,
-                best,
-                best_epoch,
-                stall,
-                cfg,
-                weights,
-                use_amp,
-            )
-            if not improved and cfg.patience is not None and stall >= cfg.patience:
+            if evaluated and not improved and cfg.patience is not None and stall >= cfg.patience:
+                stopped = "early_stop"
+            elif out_of_time and epoch < cfg.epochs:
+                stopped = "time_budget"
+            if epoch % cfg.save_every == 0 or epoch == cfg.epochs or stopped:
+                _save_last(
+                    out_dir / "last.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    global_step,
+                    best,
+                    best_epoch,
+                    stall,
+                    cfg,
+                    weights,
+                    use_amp,
+                    rng=_rng_state(train_loader),
+                )
+                if cfg.keep_last > 0:
+                    _snapshot(out_dir, epoch, cfg.keep_last)
+            if stopped == "early_stop":
                 print(f"early stop at epoch {epoch} (patience {cfg.patience})")
                 break
+            if stopped:
+                print(f"time budget: stopping after epoch {epoch}; resume to carry on (--max-minutes {cfg.max_minutes:g})")
+                break
 
-    return _result(best, best_epoch, epochs_ran, n_params, out_dir, jsonl_path)
+    result = _result(best, best_epoch, epochs_ran, n_params, out_dir, jsonl_path)
+    if stopped == "time_budget":
+        result["stopped"] = "time_budget"
+    return result
 
 
 def _result(best, best_epoch, epochs_ran, n_params, out_dir, jsonl_path) -> dict:
@@ -1074,6 +1201,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="With cosine on, the learning rate never falls below --lr times this. Default 0, anneal to zero.",
     )
+    parser.add_argument("--save-every", type=int, default=1, help="Write last.pt every N epochs (and on the last or a stop). Default 1.")
+    parser.add_argument("--keep-last", type=int, default=0, help="Also keep the K newest ckpt_eNNNNN.pt copies of last.pt. Default 0, none.")
+    parser.add_argument("--eval-every", type=int, default=1, help="Validate every N epochs (and on the last or a stop). Default 1.")
+    parser.add_argument(
+        "--max-minutes",
+        type=float,
+        default=None,
+        help="Stop cleanly after a saved epoch once another would not fit in this many minutes from now. Resume later.",
+    )
+    parser.add_argument("--init-from", default=None, help="Start a NEW run from the weights in this checkpoint (a fork).")
+    parser.add_argument("--init-optimizer", action="store_true", help="With --init-from, also take the AdamW moments (not best.pt).")
     parser.add_argument(
         "--amp",
         action="store_true",
@@ -1180,6 +1318,12 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         warmup_steps=args.warmup_steps,
         clip_grad_norm=args.clip_grad_norm,
         cosine_floor=args.cosine_floor,
+        save_every=args.save_every,
+        keep_last=args.keep_last,
+        eval_every=args.eval_every,
+        max_minutes=args.max_minutes,
+        init_from=args.init_from,
+        init_optimizer=bool(args.init_optimizer),
     )
 
 
