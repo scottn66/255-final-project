@@ -565,8 +565,11 @@ def _checkpoint_epoch(path: Path) -> int:
 def run(out_dir, train_args, repo=None) -> dict | None:
     """Run ``sw.train`` once into ``out_dir`` so that calling it again is safe.
 
-    * ``DONE.json`` exists: return it; nothing runs. (To train longer,
-      delete ``DONE.json`` and call again with the larger ``--epochs``.)
+    * ``DONE.json`` exists: return it; nothing runs. (To train a
+      ``--no-cosine`` run longer, delete ``DONE.json`` and call again with
+      the larger ``--epochs``. Do not extend a cosine run: its schedule
+      keeps the length it started with and the rate climbs back up, so
+      ``sw.train`` prints a warning. Use a new folder.)
     * another live process holds ``RUNNING.json``: raise.
     * the flags differ from the ones the folder was started with (ignoring
       ``RESUMABLE_FLAGS``): raise.
