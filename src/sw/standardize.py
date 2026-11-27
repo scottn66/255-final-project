@@ -8,6 +8,7 @@ run ``out_dir``) keeps recomputation off the hot path without committing
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -110,7 +111,9 @@ def save_band_stats(path: Path | str, mean: torch.Tensor, std: torch.Tensor, *, 
         "split": "train",
         "n_bands": int(torch.as_tensor(mean).numel()),
     }
-    torch.save(payload, path)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
 
 
 def load_band_stats(path: Path | str) -> tuple[torch.Tensor, torch.Tensor]:

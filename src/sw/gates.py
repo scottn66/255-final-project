@@ -92,7 +92,7 @@ RUNNING_FILE = "RUNNING.json"
 ARGS_FILE = "ARGS.json"
 # Flags that may change between sessions without changing what the run
 # is: how many epochs in total, where the cubes are, the device, the loaders.
-RESUMABLE_FLAGS = ("--epochs", "--data-root", "--device", "--num-workers")
+RESUMABLE_FLAGS = ("--epochs", "--data-root", "--device", "--num-workers", "--max-minutes")
 _PROC = Path("/proc")
 
 _SPLIT_FILES = (("hyper", ".tiff"), ("labels_hyper_lt", ".png"))
@@ -101,6 +101,17 @@ _SPLIT_FILES = (("hyper", ".tiff"), ("labels_hyper_lt", ".png"))
 # reaches this. Metrics are one row per epoch; steps_to_escape sums the
 # per-epoch ``steps`` field through that epoch.
 ESCAPE_FG = 0.05
+
+
+def atomic_write_text(path, text: str) -> None:
+    """Write ``text`` to a temporary file next to ``path``, then rename it over ``path``.
+
+    A reader (or a session that dies mid-write) sees the old file or the new one, never half.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def read_metrics(path) -> list[dict]:
@@ -536,7 +547,7 @@ def _trim_logs(out_dir: Path, last_epoch: int) -> None:
             else:
                 dropped += 1
         if dropped:
-            jsonl.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+            atomic_write_text(jsonl, "".join(line + "\n" for line in kept))
             print(f"{jsonl}: dropped {dropped} row(s) after epoch {last_epoch} (written after the checkpoint)")
     table = out_dir / "metrics.csv"
     if table.is_file():
@@ -546,8 +557,10 @@ def _trim_logs(out_dir: Path, last_epoch: int) -> None:
             head, body = rows[0], rows[1:]
             keep = [row for row in body if row and row[0].isdigit() and int(row[0]) <= last_epoch]
             if len(keep) != len(body):
-                with table.open("w", newline="", encoding="utf-8") as handle:
+                tmp = table.with_name(table.name + ".tmp")
+                with tmp.open("w", newline="", encoding="utf-8") as handle:
                     csv.writer(handle).writerows([head, *keep])
+                os.replace(tmp, table)
 
 
 def _checkpoint_epoch(path: Path) -> int:
@@ -565,8 +578,11 @@ def _checkpoint_epoch(path: Path) -> int:
 def run(out_dir, train_args, repo=None) -> dict | None:
     """Run ``sw.train`` once into ``out_dir`` so that calling it again is safe.
 
-    * ``DONE.json`` exists: return it; nothing runs. (To train longer,
-      delete ``DONE.json`` and call again with the larger ``--epochs``.)
+    * ``DONE.json`` exists: return it; nothing runs. (To train a
+      ``--no-cosine`` run longer, delete ``DONE.json`` and call again with
+      the larger ``--epochs``. Do not extend a cosine run: its schedule
+      keeps the length it started with and the rate climbs back up, so
+      ``sw.train`` prints a warning. Use a new folder.)
     * another live process holds ``RUNNING.json``: raise.
     * the flags differ from the ones the folder was started with (ignoring
       ``RESUMABLE_FLAGS``): raise.
@@ -577,8 +593,8 @@ def run(out_dir, train_args, repo=None) -> dict | None:
     ``train_args`` are ``sw.train`` flags without ``--out-dir`` or
     ``--resume``; this function adds both. On success it writes
     ``DONE.json`` (the result, the flags, the git commit, the wall time)
-    before it releases ``RUNNING.json``. On failure there is no
-    ``DONE.json``, so the next call resumes.
+    before it releases ``RUNNING.json``. On failure, or when ``--max-minutes``
+    stopped the run cleanly, there is no ``DONE.json``, so the next call resumes.
     """
     from sw.train import main as train_main
 
@@ -601,13 +617,13 @@ def run(out_dir, train_args, repo=None) -> dict | None:
         return done
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (out_dir / ARGS_FILE).is_file():
-        (out_dir / ARGS_FILE).write_text(json.dumps(train_args), encoding="utf-8")
+        atomic_write_text(out_dir / ARGS_FILE, json.dumps(train_args))
     argv = [*train_args, "--out-dir", str(out_dir)]
     if state == "partial":
         _trim_logs(out_dir, _checkpoint_epoch(out_dir / "last.pt"))
         argv += ["--resume", str(out_dir / "last.pt")]
     running = out_dir / RUNNING_FILE
-    running.write_text(json.dumps({**_holder_record(os.getpid()), "argv": argv}), encoding="utf-8")
+    atomic_write_text(running, json.dumps({**_holder_record(os.getpid()), "argv": argv}))
     start = time.time()
     try:
         result = train_main(argv)
@@ -618,20 +634,25 @@ def run(out_dir, train_args, repo=None) -> dict | None:
             "commit": _git_commit(repo or Path(__file__).resolve().parent),
             "wall_seconds": round(time.time() - start, 1),
         }
-        (out_dir / DONE_FILE).write_text(json.dumps(done, indent=2), encoding="utf-8")
+        if result.get("stopped") == "time_budget":
+            # A clean stop at --max-minutes: not finished, so no DONE.json; the next call resumes.
+            done["paused"] = True
+        else:
+            atomic_write_text(out_dir / DONE_FILE, json.dumps(done, indent=2))
     finally:
         running.unlink(missing_ok=True)
     return done
 
 
-def launch(out_dir, train_args, env=None, log_name="train.log") -> subprocess.Popen | None:
+def launch(out_dir, train_args, env=None, log_name="train.log", cmd=None) -> subprocess.Popen | None:
     """Start ``python -m sw.gates run`` in the background, in its own session.
 
     Interrupting a notebook cell does not stop it. The output goes to
     ``out_dir/<log_name>``, appended. The child's pid goes into
     ``RUNNING.json`` at once, so a second ``launch`` right after sees it
     running. Returns None, starting nothing, when the run is done or
-    already running.
+    already running. ``cmd`` replaces the default command (``sw.longrun`` wraps
+    ``run`` in a lock); it must end up calling ``run`` in the child process.
     """
     out_dir = Path(out_dir)
     state = run_state(out_dir)
@@ -639,10 +660,10 @@ def launch(out_dir, train_args, env=None, log_name="train.log") -> subprocess.Po
         print(f"{out_dir.name}: {state}; not starting another copy")
         return None
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "sw.gates", "run", "--out-dir", str(out_dir), "--", *train_args]
+    cmd = cmd or [sys.executable, "-m", "sw.gates", "run", "--out-dir", str(out_dir), "--", *train_args]
     with open(out_dir / log_name, "a", encoding="utf-8") as log:
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
-    (out_dir / RUNNING_FILE).write_text(json.dumps(_holder_record(proc.pid)), encoding="utf-8")
+    atomic_write_text(out_dir / RUNNING_FILE, json.dumps(_holder_record(proc.pid)))
     print(f"{out_dir.name}: started pid {proc.pid} ({state}); log {out_dir / log_name}")
     return proc
 

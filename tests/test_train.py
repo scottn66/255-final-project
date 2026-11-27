@@ -852,3 +852,496 @@ def test_control_checkpoint_resumes_only_as_the_control(tmp_path, capsys):
     assert resumed["epoch"] == 2
     assert resumed["cfg"]["tokenizer"] == "collapsed"
     assert "tokenizer.reduce.weight" in resumed["model"]
+
+
+# --- Optimiser recipe: warmup, gradient clipping, cosine floor (WP7) ---
+
+
+class _TinyHead(torch.nn.Module):
+    """A 1x1 conv. ``gain`` multiplies the logits: a large one plants a huge loss."""
+
+    def __init__(self, gain=1.0):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(224, 7, kernel_size=1)
+        self.gain = gain
+
+    def forward(self, x):
+        return self.gain * self.conv(x)
+
+
+def _spy_on_steps(monkeypatch, die_at=None):
+    """Record the learning rate and the global gradient norm AdamW sees at each step.
+
+    The norm is read inside ``optimizer.step``, so it is the gradient the
+    update uses (after any clipping). ``die_at`` raises at that step, before
+    the update, to stand in for a session that dies mid-run.
+    """
+    seen = []
+    real = torch.optim.AdamW.step
+
+    def step(self, *args, **kwargs):
+        if die_at is not None and len(seen) + 1 == die_at:
+            raise KeyboardInterrupt("session died")
+        grads = [p.grad for group in self.param_groups for p in group["params"] if p.grad is not None]
+        norm = math.sqrt(sum(float((grad.detach() ** 2).sum()) for grad in grads))
+        seen.append({"lr": self.param_groups[0]["lr"], "grad_norm": norm})
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", step)
+    return seen
+
+
+def test_recipe_flags_default_to_off_and_are_checked():
+    from sw.train import TrainConfig, _build_parser, _check_cfg, _warmup_factor
+
+    parse = lambda *flags: config_from_args(_build_parser().parse_args(list(flags)))
+    off = parse()
+    assert (off.warmup_steps, off.clip_grad_norm, off.cosine_floor) == (0, None, 0.0)
+    assert (TrainConfig().warmup_steps, TrainConfig().clip_grad_norm, TrainConfig().cosine_floor) == (0, None, 0.0)
+    on = parse("--warmup-steps", "500", "--clip-grad-norm", "1.0", "--cosine-floor", "0.01")
+    assert (on.warmup_steps, on.clip_grad_norm, on.cosine_floor) == (500, 1.0, 0.01)
+    assert parse("--smoke").warmup_steps == 0  # smoke does not turn the recipe on
+
+    assert [_warmup_factor(k, 4) for k in (1, 2, 4, 5)] == [0.25, 0.5, 1.0, 1.0]
+    assert _warmup_factor(1, 0) == 1.0  # no warmup: the full rate from the first step
+
+    for bad in (dict(warmup_steps=-1), dict(clip_grad_norm=0.0), dict(clip_grad_norm=-1.0),
+                dict(clip_grad_norm=float("nan")), dict(cosine_floor=-0.1), dict(cosine_floor=1.5)):
+        with pytest.raises(ValueError, match="|".join(bad)):
+            _check_cfg(_cfg(**bad))
+
+
+def test_warmup_is_linear_in_optimizer_steps(tmp_path, monkeypatch):
+    """W = 4 at a constant rate: steps 1, W/2, W and W+1 use 1/4, 1/2, 1 and 1
+    times --lr. Two steps per epoch, so the ramp crosses an epoch boundary:
+    it counts optimizer steps, not epochs."""
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    seen = _spy_on_steps(monkeypatch)
+    cfg = _cfg(data_root=str(root), out_dir=str(tmp_path / "run"), epochs=3, batch_size=2, lr=2e-3,
+               cosine=False, warmup_steps=4)
+    train(_TinyHead(), cfg)
+    lrs = [step["lr"] for step in seen]
+    assert len(lrs) == 6
+    assert lrs[0] == pytest.approx(0.5e-3, rel=1e-12)  # step 1
+    assert lrs[1] == pytest.approx(1.0e-3, rel=1e-12)  # step W/2
+    assert lrs[3] == pytest.approx(2.0e-3, rel=1e-12)  # step W
+    assert lrs[4] == pytest.approx(2.0e-3, rel=1e-12)  # step W+1
+    assert lrs == pytest.approx([2e-3 * min(1.0, k / 4) for k in range(1, 7)], rel=1e-12)
+    last = torch.load(tmp_path / "run" / "last.pt", map_location="cpu", weights_only=False)
+    assert last["step"] == 6 and last["cfg"]["warmup_steps"] == 4
+
+    # Without the flag every step uses the full rate.
+    seen.clear()
+    train(_TinyHead(), _cfg(data_root=str(root), out_dir=str(tmp_path / "off"), epochs=1, batch_size=2, lr=2e-3, cosine=False))
+    assert [step["lr"] for step in seen] == [2e-3, 2e-3]
+
+
+def _cosine(epoch, epochs, base, floor=0.0):
+    """CosineAnnealingLR at 1-based ``epoch``: from ``base`` down toward ``base * floor``."""
+    low = base * floor
+    return low + (base - low) * (1 + math.cos(math.pi * (epoch - 1) / epochs)) / 2
+
+
+def test_warmup_multiplies_the_cosine_schedule_and_survives_resume(tmp_path, monkeypatch):
+    """Step k of epoch e uses cosine(e) * min(1, k / W). A run that dies and
+    resumes from last.pt uses the same rates as one that never stopped: the
+    step count is restored, so the ramp does not start again."""
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    base, warmup, epochs = 1e-3, 5, 4
+    expected = [_cosine(1 + (k - 1) // 2, epochs, base) * min(1.0, k / warmup) for k in range(1, 2 * epochs + 1)]
+
+    def cfg(name, **extra):
+        return _cfg(data_root=str(root), out_dir=str(tmp_path / name), epochs=epochs, batch_size=2, lr=base,
+                    warmup_steps=warmup, **extra)
+
+    seen = _spy_on_steps(monkeypatch)
+    train(_TinyHead(), cfg("whole"))
+    assert [step["lr"] for step in seen] == pytest.approx(expected, rel=1e-9)
+    assert expected[2] < expected[3] > expected[5]  # still ramping in epoch 2, annealing after
+
+    monkeypatch.undo()
+    seen = _spy_on_steps(monkeypatch, die_at=4)  # dies in epoch 2, inside the warmup
+    with pytest.raises(KeyboardInterrupt):
+        train(_TinyHead(), cfg("broken"))
+    last = tmp_path / "broken" / "last.pt"
+    saved = torch.load(last, map_location="cpu", weights_only=False)
+    assert saved["epoch"] == 1 and saved["step"] == 2
+    # The checkpoint holds the schedule's rate, not a warmed-down one.
+    assert saved["optimizer"]["param_groups"][0]["lr"] == pytest.approx(_cosine(2, epochs, base), rel=1e-9)
+
+    monkeypatch.undo()
+    resumed = _spy_on_steps(monkeypatch)
+    train(_TinyHead(), cfg("broken", resume=str(last)))
+    assert [step["lr"] for step in seen[:2] + resumed] == pytest.approx(expected, rel=1e-9)
+    assert torch.load(last, map_location="cpu", weights_only=False)["step"] == 2 * epochs
+
+
+def test_resume_of_a_checkpoint_from_before_the_recipe(tmp_path, monkeypatch):
+    """A last.pt written before this change has no step count and no recipe
+    fields in its cfg. It resumes with the flags at their defaults, and the
+    step count comes back from AdamW's own."""
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    out = tmp_path / "run"
+    cfg = dict(data_root=str(root), out_dir=str(out), batch_size=2, lr=1e-3, cosine=False)
+    train(_TinyHead(), _cfg(epochs=2, **cfg))
+    old = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    assert old.pop("step") == 4
+    for name in ("warmup_steps", "clip_grad_norm", "cosine_floor"):
+        del old["cfg"][name]
+    torch.save(old, out / "last.pt")
+
+    result = train(_TinyHead(), _cfg(epochs=3, resume=str(out / "last.pt"), **cfg))
+    assert result["epochs_ran"] == 3
+    assert torch.load(out / "last.pt", map_location="cpu", weights_only=False)["step"] == 6
+
+    # With a warmup longer than the old run, the ramp continues from step 5.
+    torch.save(old, out / "last.pt")
+    seen = _spy_on_steps(monkeypatch)
+    train(_TinyHead(), _cfg(epochs=3, resume=str(out / "last.pt"), warmup_steps=8, **cfg))
+    assert [step["lr"] for step in seen] == pytest.approx([1e-3 * 5 / 8, 1e-3 * 6 / 8], rel=1e-12)
+
+
+def test_gradient_clipping_bounds_the_norm_of_a_huge_loss_batch(tmp_path, monkeypatch):
+    """A planted huge loss (logits times 1000): without clipping the update
+    sees a gradient norm far above C; with --clip-grad-norm C it sees at most C,
+    and the log keeps the norm from before the clip."""
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    limit = 1.0
+    seen = _spy_on_steps(monkeypatch)
+
+    def run(name, **extra):
+        seen.clear()
+        torch.manual_seed(0)
+        train(_TinyHead(gain=1000.0), _cfg(data_root=str(root), out_dir=str(tmp_path / name), batch_size=2,
+                                           max_train_steps=1, cosine=False, **extra))
+        row = json.loads((tmp_path / name / "metrics.jsonl").read_text().splitlines()[0])
+        assert len(seen) == 1
+        return seen[0]["grad_norm"], row
+
+    before, plain_row = run("plain")
+    assert plain_row["train_loss"] > 10.0  # the planted loss is huge
+    assert before > 100 * limit  # and so is its gradient
+    assert "grad_norm_max" not in plain_row  # the default log is unchanged
+
+    after, clipped_row = run("clipped", clip_grad_norm=limit)
+    assert clipped_row["train_loss"] == plain_row["train_loss"]  # the same batch and weights
+    assert clipped_row["grad_norm_max"] == pytest.approx(before, rel=1e-4)  # before the clip
+    assert after <= limit * (1 + 1e-5)
+    assert after == pytest.approx(limit, rel=1e-4)  # rescaled to C, not zeroed
+
+    # A limit above the norm leaves the gradient alone.
+    loose, _ = run("loose", clip_grad_norm=10 * before)
+    assert loose == pytest.approx(before, rel=1e-6)
+
+
+def test_cosine_floor_keeps_the_rate_at_or_above_the_floor(tmp_path, monkeypatch, capsys):
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    base, floor, epochs = 1e-3, 0.2, 5
+    seen = _spy_on_steps(monkeypatch)
+
+    def rates(name, **extra):
+        seen.clear()
+        train(_TinyHead(), _cfg(data_root=str(root), out_dir=str(tmp_path / name), epochs=epochs, batch_size=2,
+                                lr=base, max_train_steps=1, **extra))
+        last = torch.load(tmp_path / name / "last.pt", map_location="cpu", weights_only=False)
+        return [step["lr"] for step in seen], last["optimizer"]["param_groups"][0]["lr"]
+
+    floored, end = rates("floor", cosine_floor=floor)
+    assert floored == pytest.approx([_cosine(e, epochs, base, floor) for e in range(1, epochs + 1)], rel=1e-9)
+    assert floored[0] == base and min(floored) >= base * floor
+    assert end == pytest.approx(base * floor, rel=1e-9)  # where the schedule ends: the floor, not 0
+
+    plain, end = rates("plain")
+    assert plain == pytest.approx([_cosine(e, epochs, base) for e in range(1, epochs + 1)], rel=1e-9)
+    assert min(plain) < base * floor  # without the flag the rate does go under it
+    assert end == pytest.approx(0.0, abs=1e-12)
+
+    # Without cosine there is nothing to floor: the rate stays at --lr, and a line says so.
+    capsys.readouterr()
+    constant, _ = rates("constant", cosine_floor=floor, cosine=False)
+    assert constant == [base] * epochs
+    assert "cosine is off" in capsys.readouterr().out
+
+
+def test_recipe_runs_through_the_cli_on_the_transformer(tmp_path, capsys):
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    out = tmp_path / "run"
+    main(
+        [
+            "--model", "transformer", "--depth-spectral", "1", "--depth-spatial", "1", "--smoke",
+            "--warmup-steps", "4", "--clip-grad-norm", "1.0", "--cosine-floor", "0.05",
+            "--data-root", str(root), "--out-dir", str(out), "--device", "cpu",
+        ]
+    )
+    printed = capsys.readouterr().out
+    assert "warmup steps 4 (done 0)  clip grad norm 1" in printed
+    assert "schedule cosine (floor 5e-05)" in printed
+    assert "lr 0.0005" in printed  # the epoch line shows the rate of its last step: 2 / 4 of 1e-3
+    row = json.loads((out / "metrics.jsonl").read_text().splitlines()[0])
+    assert row["steps"] == 2 and math.isfinite(row["grad_norm_max"]) and row["grad_norm_max"] > 0
+
+
+# --- The recipe together with the flags it was written before ---
+# --standardize, --pe-init-std, --head-prior-bias and --tokenizer are newer
+# than the recipe. These runs put both sets on one command line.
+
+_RECIPE_ARMS = {
+    "control": (
+        ["--model", "transformer", "--tokenizer", "collapsed", "--depth-spectral", "0", "--depth-spatial", "8", "--standardize"],
+        3, 6,  # warmup 3, dies in epoch 3: the warmup is over, the cosine is not
+    ),
+    "fused": (
+        ["--model", "transformer", "--standardize", "--pe-init-std", "0.02", "--head-prior-bias"],
+        5, 4,  # warmup 5, dies in epoch 2: inside the warmup
+    ),
+    "cnn": (["--standardize"], 3, 6),
+}
+
+
+@pytest.mark.parametrize("arm", sorted(_RECIPE_ARMS))
+def test_recipe_with_the_newer_flags_follows_the_schedule_and_resumes(arm, tmp_path, monkeypatch, capsys):
+    """Each arm with the full recipe: step k of epoch e uses
+    cosine(e, floor) * min(1, k / W), every row has ``grad_norm_max``, and a
+    run that dies and resumes uses the rates of one that never stopped."""
+    flags, warmup, die_at = _RECIPE_ARMS[arm]
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    base, floor, epochs, clip = 1e-3, 0.01, 4, 1.0
+    expected = [
+        _cosine(1 + (k - 1) // 2, epochs, base, floor) * min(1.0, k / warmup) for k in range(1, 2 * epochs + 1)
+    ]
+
+    def argv(name):
+        return [
+            *flags, "--warmup-steps", str(warmup), "--clip-grad-norm", str(clip), "--cosine-floor", str(floor),
+            "--epochs", str(epochs), "--batch-size", "2", "--num-workers", "0", "--device", "cpu", "--seed", "0",
+            "--data-root", str(root), "--out-dir", str(tmp_path / name),
+        ]
+
+    def rows(name):
+        return [json.loads(line) for line in (tmp_path / name / "metrics.jsonl").read_text().splitlines() if line.strip()]
+
+    seen = _spy_on_steps(monkeypatch)
+    main(argv("whole"))
+    printed = capsys.readouterr().out
+    assert [step["lr"] for step in seen] == pytest.approx(expected, rel=1e-9)
+    assert max(step["grad_norm"] for step in seen) <= clip * (1 + 1e-4)  # what AdamW saw
+    assert f"warmup steps {warmup} (done 0)  clip grad norm 1" in printed
+    assert "schedule cosine (floor 1e-05)" in printed
+    assert "standardize: train band stats" in printed
+    whole = rows("whole")
+    assert [row["epoch"] for row in whole] == [1, 2, 3, 4]
+    assert all(math.isfinite(row["grad_norm_max"]) and row["grad_norm_max"] > 0 for row in whole)
+    last = torch.load(tmp_path / "whole" / "last.pt", map_location="cpu", weights_only=False)
+    assert last["step"] == 2 * epochs
+    assert last["scheduler"]["eta_min"] == pytest.approx(base * floor)
+    stored = last["cfg"]
+    assert (stored["warmup_steps"], stored["clip_grad_norm"], stored["cosine_floor"]) == (warmup, clip, floor)
+    assert stored["standardize"] is True
+    if arm == "control":
+        assert stored["tokenizer"] == "collapsed" and "tokenizer.reduce.weight" in last["model"]
+    if arm == "fused":
+        assert stored["pe_init_std"] == 0.02 and stored["head_prior_bias"] is True
+
+    monkeypatch.undo()
+    seen = _spy_on_steps(monkeypatch, die_at=die_at)
+    with pytest.raises(KeyboardInterrupt):
+        main(argv("broken"))
+    checkpoint = tmp_path / "broken" / "last.pt"
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    done = saved["step"]
+    assert done == 2 * saved["epoch"] == die_at - 2
+    assert (done < warmup) == (arm == "fused")  # fused stops inside the warmup, the others after it
+
+    monkeypatch.undo()
+    resumed = _spy_on_steps(monkeypatch)
+    capsys.readouterr()
+    main([*argv("broken"), "--resume", str(checkpoint)])
+    assert f"warmup steps {warmup} (done {min(done, warmup)})" in capsys.readouterr().out
+    assert [step["lr"] for step in seen[:done] + resumed] == pytest.approx(expected, rel=1e-9)
+    broken = rows("broken")
+    assert [row["epoch"] for row in broken] == [1, 2, 3, 4]
+    assert all("grad_norm_max" in row for row in broken)
+    assert torch.load(checkpoint, map_location="cpu", weights_only=False)["step"] == 2 * epochs
+
+
+def test_warmup_without_cosine_on_the_control_reaches_the_full_rate_and_stays(tmp_path, monkeypatch, capsys):
+    """--no-cosine with the whole recipe: the ramp, then --lr at every step.
+    --cosine-floor has nothing to bound, and a line says so."""
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    seen = _spy_on_steps(monkeypatch)
+    main(
+        [
+            *_RECIPE_ARMS["control"][0], "--no-cosine",
+            "--warmup-steps", "3", "--clip-grad-norm", "1.0", "--cosine-floor", "0.01",
+            "--epochs", "3", "--batch-size", "2", "--num-workers", "0", "--device", "cpu",
+            "--data-root", str(root), "--out-dir", str(tmp_path / "run"),
+        ]
+    )
+    printed = capsys.readouterr().out
+    assert [step["lr"] for step in seen] == pytest.approx([1e-3 / 3, 2e-3 / 3, 1e-3, 1e-3, 1e-3, 1e-3], rel=1e-9)
+    assert "cosine_floor applies to the cosine schedule only" in printed
+    assert "schedule constant  amp" in printed  # no floor in the banner
+    last = torch.load(tmp_path / "run" / "last.pt", map_location="cpu", weights_only=False)
+    assert last["scheduler"] is None and last["step"] == 6
+
+
+# --- Edges of the recipe: resume with other flags, non-finite norms, call order ---
+
+
+def test_cosine_floor_does_not_bound_the_warmup_ramp(tmp_path, monkeypatch):
+    """W = 10 with a floor of half of --lr: step 1 uses --lr / 10, far under the floor."""
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    base, floor, warmup, epochs = 1e-3, 0.5, 10, 3
+    seen = _spy_on_steps(monkeypatch)
+    train(_TinyHead(), _cfg(data_root=str(root), out_dir=str(tmp_path / "run"), epochs=epochs, batch_size=2, lr=base,
+                            warmup_steps=warmup, cosine_floor=floor))
+    lrs = [step["lr"] for step in seen]
+    assert lrs[0] == pytest.approx(base / 10, rel=1e-9)
+    assert lrs[0] < base * floor
+    assert lrs == pytest.approx(
+        [_cosine(1 + (k - 1) // 2, epochs, base, floor) * k / warmup for k in range(1, 2 * epochs + 1)], rel=1e-9
+    )
+
+
+def test_resume_refuses_another_cosine_floor_and_warns_about_more_epochs(tmp_path, monkeypatch, capsys):
+    """A resume keeps the schedule in last.pt. Another floor would print one
+    rate and train at another, so it is refused. A larger --epochs still runs
+    (older runs did it), with a warning: the rate climbs back up."""
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    out = tmp_path / "run"
+    last = out / "last.pt"
+    base, floor = 1e-3, 0.01
+    cfg = dict(data_root=str(root), out_dir=str(out), batch_size=2, lr=base, max_train_steps=1)
+    train(_TinyHead(), _cfg(epochs=3, cosine_floor=floor, **cfg))
+    before = last.read_bytes()
+    rows = (out / "metrics.jsonl").read_text(encoding="utf-8")
+
+    for other in (0.5, 0.0):
+        with pytest.raises(ValueError, match="cosine floor"):
+            train(_TinyHead(), _cfg(epochs=3, cosine_floor=other, resume=str(last), **cfg))
+    assert last.read_bytes() == before  # a refused resume writes nothing
+    assert (out / "metrics.jsonl").read_text(encoding="utf-8") == rows
+
+    # The same flags: nothing to say.
+    capsys.readouterr()
+    train(_TinyHead(), _cfg(epochs=3, cosine_floor=floor, resume=str(last), **cfg))
+    assert "WARNING" not in capsys.readouterr().out
+
+    # A larger --epochs: the warning, and the rise it warns about.
+    seen = _spy_on_steps(monkeypatch)
+    train(_TinyHead(), _cfg(epochs=6, cosine_floor=floor, resume=str(last), **cfg))
+    printed = capsys.readouterr().out
+    assert "WARNING" in printed and "3 epochs long and --epochs is 6" in printed
+    assert "climbs back up" in printed
+    lrs = [step["lr"] for step in seen]
+    assert len(lrs) == 3 and lrs[0] == pytest.approx(base * floor, rel=1e-9) and lrs[0] < lrs[1] < lrs[2]
+
+    # A smaller floor of zero on a floor-zero checkpoint, and no cosine at all, stay quiet.
+    plain = tmp_path / "plain"
+    train(_TinyHead(), _cfg(epochs=2, **{**cfg, "out_dir": str(plain)}))
+    capsys.readouterr()
+    train(_TinyHead(), _cfg(epochs=2, cosine=False, cosine_floor=0.5, resume=str(plain / "last.pt"), **{**cfg, "out_dir": str(plain)}))
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_grad_norm_max_is_the_largest_finite_norm_and_the_row_stays_strict_json(tmp_path, monkeypatch):
+    """Planted norms, two steps per epoch. Epoch 1: 7 then 2, so the maximum
+    is not the last step. Epoch 2: NaN then 3. Epoch 3: inf then NaN."""
+    from sw.train import train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    planted = iter([7.0, 2.0, float("nan"), 3.0, float("inf"), float("nan")])
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", lambda params, limit: torch.tensor(next(planted)))
+    out = tmp_path / "run"
+    train(_TinyHead(), _cfg(data_root=str(root), out_dir=str(out), epochs=3, batch_size=2, cosine=False, clip_grad_norm=1.0))
+
+    def strict(name):
+        raise AssertionError(f"{name} is not JSON")
+
+    rows = [json.loads(line, parse_constant=strict) for line in (out / "metrics.jsonl").read_text().splitlines()]
+    assert [row["steps"] for row in rows] == [2, 2, 2]
+    assert [row["grad_norm_max"] for row in rows] == [7.0, 3.0, None]
+    assert [row["grad_nonfinite_steps"] for row in rows] == [0, 1, 2]
+    from sw import gates
+
+    assert [row["grad_norm_max"] for row in gates.read_metrics(out / "metrics.jsonl")] == [7.0, 3.0, None]
+
+
+def test_clipping_unscales_before_the_clip_and_clips_before_the_step(tmp_path, monkeypatch):
+    """Under --amp the gradients are scaled until ``unscale_``. No GPU here, so
+    a stand-in scaler records the order of the calls: backward, unscale_,
+    clip, step, update. Without clipping ``unscale_`` is not called."""
+    import sw.train as train_module
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    calls = []
+
+    class _Scaled:
+        def __init__(self, loss):
+            self.loss = loss
+
+        def backward(self):
+            calls.append("backward")
+            self.loss.backward()
+
+    class _Scaler:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def scale(self, loss):
+            return _Scaled(loss)
+
+        def unscale_(self, optimizer):
+            calls.append("unscale")
+
+        def step(self, optimizer):
+            calls.append("step")
+            optimizer.step()
+
+        def update(self):
+            calls.append("update")
+
+        def state_dict(self):
+            return {}
+
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def clip(params, limit):
+        calls.append("clip")
+        return real_clip(params, limit)
+
+    monkeypatch.setattr(train_module.torch.amp, "GradScaler", _Scaler)
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip)
+    cfg = dict(data_root=str(root), batch_size=2, cosine=False)
+    train_module.train(_TinyHead(), _cfg(out_dir=str(tmp_path / "clip"), clip_grad_norm=1.0, **cfg))
+    assert calls == ["backward", "unscale", "clip", "step", "update"] * 2
+
+    calls.clear()
+    train_module.train(_TinyHead(), _cfg(out_dir=str(tmp_path / "plain"), **cfg))
+    assert calls == ["backward", "step", "update"] * 2
