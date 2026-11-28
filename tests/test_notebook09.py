@@ -69,7 +69,6 @@ def test_notebook_is_valid():
         assert isinstance(cell["source"], list)
         if cell["cell_type"] == "code":
             assert isinstance(cell["outputs"], list)  # committed with the outputs of its Colab run
-            assert cell["execution_count"] is None
             ast.parse("".join(cell["source"]))
     header = "".join(nb["cells"][0]["source"])
     assert "/blob/wp7-screen-notebook/notebooks/09_fullres_fused_vs_control.ipynb" in header
