@@ -33,6 +33,10 @@ The band-collapsed control for the fusion claim is the same transformer
 with ``--tokenizer collapsed --depth-spectral 0 --depth-spatial 8``
 (491,191 parameters against 488,487). Give it its own ``--out-dir``.
 
+``--head-skip`` (transformer only, off by default) adds the head's
+full-resolution spectral skip: 4,112 more parameters on either model.
+``python -m sw.skip_probe`` scores such a run with each head path zeroed.
+
 ``--smoke`` is two optimizer steps on a few images. It is a CPU-friendly
 wiring check. The number it prints is not a result to put on a slide.
 
@@ -125,6 +129,13 @@ class TrainConfig:
     ``pe_init_std`` have no effect with it. A config saved before this
     field existed has no ``tokenizer`` entry and means ``"band"``.
 
+    ``head_skip`` turns on the head's full-resolution spectral skip (a 1x1
+    conv from the input bands to 16 channels, joined to the decoder map
+    before the head's last two convs). Transformer only, default off, and
+    4,112 more parameters at 224 bands. A config saved before this field
+    existed has no ``head_skip`` entry and means off. A checkpoint resumes
+    only with the setting it was trained with.
+
     Default ``lr`` stays ``1e-3`` for both models. For the transformer on
     raw (non-standardised) cubes, ``3e-4`` is the recommended starting
     point; see ``docs/INPUT-BLIND.md``.
@@ -168,6 +179,7 @@ class TrainConfig:
     pe_init_std: float = 1.0
     head_prior_bias: bool = False
     tokenizer: str = "band"
+    head_skip: bool = False
 
 
 def resolve_device(name: str) -> torch.device:
@@ -416,6 +428,17 @@ def _check_tokenizer(cfg: TrainConfig) -> None:
         )
 
 
+def _check_head_skip(cfg: TrainConfig) -> None:
+    """``head_skip`` is a transformer option. ``_check_cfg`` and ``build_model`` both call this."""
+    if cfg.head_skip and cfg.model != "transformer":
+        raise ValueError("--head-skip applies only to --model transformer")
+
+
+def _has_head_skip(model: nn.Module) -> bool:
+    """True when ``model`` is a transformer whose head has the spectral skip."""
+    return getattr(getattr(model, "head", None), "skip", None) is not None
+
+
 def _check_cfg(cfg: TrainConfig) -> None:
     if cfg.epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {cfg.epochs}")
@@ -464,6 +487,7 @@ def _check_cfg(cfg: TrainConfig) -> None:
     if cfg.head_prior_bias and cfg.model != "transformer":
         raise ValueError("--head-prior-bias applies only to --model transformer")
     _check_tokenizer(cfg)
+    _check_head_skip(cfg)
 
 
 def _log_mode(path: Path, resume: bool) -> str:
@@ -514,6 +538,19 @@ def _load_resume(path, model, optimizer, scheduler, scaler, device, use_amp) -> 
         raise KeyError(
             f"{path} has weights but no optimizer. Resume from last.pt "
             "(best.pt is the best weights only)."
+        )
+    # The skip changes the shape of head.fuse and adds head.skip. Say which
+    # flag is wrong before load_state_dict lists the keys.
+    saved_skip = any(key.startswith("head.skip.") for key in ckpt["model"])
+    if saved_skip != _has_head_skip(model):
+        if saved_skip:
+            raise RuntimeError(
+                f"{path} was trained with --head-skip and this run has no --head-skip. "
+                "Resume it with --head-skip."
+            )
+        raise RuntimeError(
+            f"{path} was trained without --head-skip and this run has --head-skip. "
+            "Resume it without the flag, or give the head-skip run its own --out-dir."
         )
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
@@ -633,6 +670,11 @@ def train(model: nn.Module, cfg: TrainConfig) -> dict:
             f"blocks {model.depth_spectral}+{model.depth_spatial}  dim {model.dim}  "
             f"heads {model.heads}  mlp_ratio {float(model.mlp_ratio)}  patch {model.patch}"
         )
+        if _has_head_skip(model):
+            # Printed only when the skip is on, so a run without it logs
+            # the lines it always logged.
+            conv = model.head.skip[0]
+            print(f"head skip  on  1x1 conv {conv.in_channels}->{conv.out_channels} from the model input, at its resolution")
     print(
         f"device {device}  epochs {start_epoch}-{cfg.epochs}  batch {cfg.batch_size}  "
         f"lr {cfg.lr}  weight_decay {cfg.weight_decay}  schedule {schedule}  amp {'on' if use_amp else 'off'}"
@@ -968,6 +1010,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Init SegHead classifier bias to log train class priors (transformer only).",
     )
     parser.add_argument(
+        "--head-skip",
+        action="store_true",
+        help=(
+            "Transformer only. Add the head's full-resolution spectral skip: a 1x1 conv from the input bands "
+            "to 16 channels, joined to the decoder map before the last two convs (4,112 more parameters at "
+            "224 bands). Off by default. A checkpoint resumes only with the setting it was trained with, "
+            "so give a head-skip run its own --out-dir."
+        ),
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Two train steps on 4 train images and 2 val images (1 epoch, batch 2). CPU wiring check, not a score.",
@@ -1032,6 +1084,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         pe_init_std=args.pe_init_std,
         head_prior_bias=bool(args.head_prior_bias),
         tokenizer=args.tokenizer,
+        head_skip=bool(args.head_skip),
     )
 
 
@@ -1048,8 +1101,12 @@ def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
     ``cfg.tokenizer`` picks the transformer's tokenizer. A combination
     ``_check_cfg`` would refuse (``collapsed`` with spectral blocks, or
     with the CNN) is refused here too, before anything is built.
+
+    ``cfg.head_skip`` builds the transformer with the head's spectral skip.
+    With the CNN it is refused here too.
     """
     _check_tokenizer(cfg)
+    _check_head_skip(cfg)
     if cfg.model == "cnn":
         return MiniNetSeg(in_channels=in_channels)
     if cfg.model == "transformer":
@@ -1065,6 +1122,7 @@ def build_model(cfg: TrainConfig, in_channels: int = 224) -> nn.Module:
             patch=cfg.patch,
             pe_init_std=cfg.pe_init_std,
             tokenizer=cfg.tokenizer,
+            head_skip=cfg.head_skip,
         )
         if cfg.head_prior_bias:
             init_seg_head_prior_bias(model.head, HYPER_LT_TRAIN_PIXEL_COUNTS)

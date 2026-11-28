@@ -579,6 +579,12 @@ def run(out_dir, train_args, repo=None) -> dict | None:
     ``DONE.json`` (the result, the flags, the git commit, the wall time)
     before it releases ``RUNNING.json``. On failure there is no
     ``DONE.json``, so the next call resumes.
+
+    ``ARGS.json`` (the flags the folder was started with) is written when
+    the folder has none. If the folder had a ``last.pt`` and no
+    ``ARGS.json``, and the resume fails before it finishes an epoch, the
+    new ``ARGS.json`` is removed again, so flags that never trained here
+    are not recorded as the folder's.
     """
     from sw.train import main as train_main
 
@@ -600,10 +606,13 @@ def run(out_dir, train_args, repo=None) -> dict | None:
         print(f"{out_dir}: already done (epochs_ran {done['result'].get('epochs_ran')}); skipping")
         return done
     out_dir.mkdir(parents=True, exist_ok=True)
-    if not (out_dir / ARGS_FILE).is_file():
+    wrote_args = not (out_dir / ARGS_FILE).is_file()
+    if wrote_args:
         (out_dir / ARGS_FILE).write_text(json.dumps(train_args), encoding="utf-8")
     argv = [*train_args, "--out-dir", str(out_dir)]
+    last_before = None
     if state == "partial":
+        last_before = (out_dir / "last.pt").stat().st_mtime_ns
         _trim_logs(out_dir, _checkpoint_epoch(out_dir / "last.pt"))
         argv += ["--resume", str(out_dir / "last.pt")]
     running = out_dir / RUNNING_FILE
@@ -619,6 +628,14 @@ def run(out_dir, train_args, repo=None) -> dict | None:
             "wall_seconds": round(time.time() - start, 1),
         }
         (out_dir / DONE_FILE).write_text(json.dumps(done, indent=2), encoding="utf-8")
+    except BaseException:
+        # A resume that failed before it finished an epoch (for example the
+        # checkpoint was refused) added nothing to the folder. If this call
+        # wrote ARGS.json, take it back: these flags are not the folder's.
+        last = out_dir / "last.pt"
+        if wrote_args and last_before is not None and last.is_file() and last.stat().st_mtime_ns == last_before:
+            (out_dir / ARGS_FILE).unlink(missing_ok=True)
+        raise
     finally:
         running.unlink(missing_ok=True)
     return done

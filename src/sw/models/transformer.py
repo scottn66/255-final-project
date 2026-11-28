@@ -363,6 +363,8 @@ class SegHead(nn.Module):
         bilinear x2, 3x3 conv + GELU             (B, 32, 128, 128)
         bilinear to (h * patch, w * patch)       (B, 32, 256, 256)
         replicate-pad to out_size                (unchanged here)
+        [skip only] concat 1x1 conv + GELU of    (B, 32 + 16, 256, 256)
+            the input image, 224 -> 16
         1x1 conv + GELU, Dropout2d, 1x1 conv     (B, 7, 256, 256)
 
     Why each step:
@@ -384,8 +386,16 @@ class SegHead(nn.Module):
       3x3 conv runs at half resolution) and the final x2 is plain
       bilinear, so class boundaries come out about a pixel blurred, and
       1-2 pixel objects (filament, video tape) are hard for this head
-      alone. A full-resolution spectral skip, a separate change, is the
-      per-pixel path.
+      alone. The full-resolution spectral skip below is the per-pixel path.
+    - The skip (``skip_channels > 0``, off by default): a 1x1 conv and a
+      GELU on the image the tokens came from, ``n_bands`` to
+      ``skip_channels`` channels at ``out_size``. It is concatenated with
+      the padded map, and the next 1x1 conv (``fuse``) takes
+      ``hidden + skip_channels`` channels. A 1x1 conv reads one pixel, so
+      this path gives each pixel its own spectrum at full resolution, with
+      no neighbours and no tokens. It also means the head can label a
+      pixel from its spectrum alone, without the transformer.
+      ``sw.skip_probe`` scores a trained model with either path zeroed.
     - Pad, never stretch: the tokenizer drops the pixels past the last full
       patch (a 30 by 40 input gives a 3 by 5 grid over 24 by 40). The map is
       resized to exactly the covered 24 by 40, and the leftover rows and
@@ -402,8 +412,14 @@ class SegHead(nn.Module):
 
     At ``D = 64``, ``hidden = 32``, 7 classes and ``patch = 8``, the head has
     21,991 parameters (the tests derive this from the layer sizes). The
-    optional full-resolution spectral skip of the recipe is a separate
-    change.
+    skip at 224 bands and 16 channels adds 4,112: 3,600 for its 1x1 conv
+    and 512 more weights in ``fuse``. That gives 26,103.
+
+    With the skip off the head is the one it was before the skip existed:
+    the same modules, state-dict keys and random draws. The skip conv is
+    built last, after the classifier, so with the skip on the layers up to
+    ``up`` still draw the weights they drew before (``fuse`` has a new
+    shape, so it and the classifier draw new ones).
     """
 
     def __init__(
@@ -413,6 +429,8 @@ class SegHead(nn.Module):
         patch: int = 8,
         hidden: int = 32,
         dropout: float = 0.0,
+        skip_channels: int = 0,
+        n_bands: int = 224,
     ):
         super().__init__()
         if dim < 1:
@@ -425,10 +443,17 @@ class SegHead(nn.Module):
             raise ValueError(f"hidden must be >= 1, got {hidden}")
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+        if skip_channels < 0:
+            raise ValueError(f"skip_channels must be >= 0, got {skip_channels}")
+        if skip_channels and n_bands < 1:
+            raise ValueError(f"n_bands must be >= 1, got {n_bands}")
         self.dim = dim
         self.num_classes = num_classes
         self.patch = patch
         self.hidden = hidden
+        self.skip_channels = skip_channels
+        # The image bands the skip reads. Not used when the skip is off.
+        self.n_bands = n_bands
 
         self.norm = nn.LayerNorm(dim)
         self.proj = nn.Sequential(nn.Conv2d(dim, hidden, kernel_size=1), nn.GELU())
@@ -444,13 +469,19 @@ class SegHead(nn.Module):
                 for _ in range(n_up)
             ]
         )
-        self.fuse = nn.Sequential(nn.Conv2d(hidden, hidden, kernel_size=1), nn.GELU())
+        # With the skip on, fuse also takes the skip's channels.
+        self.fuse = nn.Sequential(nn.Conv2d(hidden + skip_channels, hidden, kernel_size=1), nn.GELU())
         # Dropout2d zeroes whole channels (the same channels at every pixel of
         # an image) in training. Off by default.
         self.drop = nn.Dropout2d(dropout)
         # Conv2d bias defaults to a small uniform draw, not class priors. Use
         # :func:`init_seg_head_prior_bias` (``--head-prior-bias``) for log priors.
         self.classifier = nn.Conv2d(hidden, num_classes, kernel_size=1)
+        # The full-resolution spectral skip. Built last, and only when it is
+        # on: with it off, no module, state-dict key or random draw is added.
+        self.skip = None
+        if skip_channels:
+            self.skip = nn.Sequential(nn.Conv2d(n_bands, skip_channels, kernel_size=1), nn.GELU())
 
     def forward(
         self,
@@ -458,8 +489,13 @@ class SegHead(nn.Module):
         h: int,
         w: int,
         out_size: tuple[int, int],
+        image: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``(B, N, D) -> (B, num_classes, H, W)``; see the class docstring."""
+        """``(B, N, D) -> (B, num_classes, H, W)``; see the class docstring.
+
+        ``image`` is the ``(B, n_bands, H, W)`` input the tokens came from.
+        The skip needs it, and a head without the skip refuses it.
+        """
         if tokens.ndim != 3 or tokens.shape[1] != h * w or tokens.shape[2] != self.dim:
             raise ValueError(
                 f"expected (B, {h * w}, {self.dim}) for a {h}x{w} grid, got {tuple(tokens.shape)}"
@@ -471,6 +507,18 @@ class SegHead(nn.Module):
             raise ValueError(
                 f"out_size {height}x{width} does not match a {h}x{w} grid of {p}-pixel patches "
                 f"(need {h * p}..{(h + 1) * p - 1} by {w * p}..{(w + 1) * p - 1})"
+            )
+        # getattr: a head object pickled before the skip existed has no ``skip``.
+        skip = getattr(self, "skip", None)
+        if skip is None:
+            if image is not None:
+                raise ValueError("this head has no skip (skip_channels=0), so it takes no image")
+        elif image is None:
+            raise ValueError("the skip needs the input image: pass image=(B, n_bands, H, W)")
+        elif image.ndim != 4 or tuple(image.shape) != (b, self.n_bands, height, width):
+            raise ValueError(
+                f"expected an image of shape ({b}, {self.n_bands}, {height}, {width}) for the skip, "
+                f"got {tuple(image.shape)}"
             )
         # (B, N, D) -> (B, D, N) -> (B, D, h, w). The transpose matters: a
         # plain reshape of (B, N, D) would scramble tokens and channels.
@@ -487,6 +535,9 @@ class SegHead(nn.Module):
         if pad_h or pad_w:
             # F.pad takes (left, right, top, bottom) for the last two axes.
             y = F.pad(y, (0, pad_w, 0, pad_h), mode="replicate")
+        if skip is not None:
+            # One 1x1 conv on the image itself: each pixel's own spectrum.
+            y = torch.cat([y, skip(image)], dim=1)  # (B, hidden + skip_channels, H, W)
         y = self.fuse(y)  # (B, hidden, H, W)
         return self.classifier(self.drop(y))  # (B, num_classes, H, W)
 
@@ -517,6 +568,11 @@ def init_seg_head_prior_bias(
     return bias
 
 
+# Channels of the head's full-resolution spectral skip (``head_skip=True``).
+# 16 is the recipe value: "1x1 spectral skip (224 -> 16)" in docs/RECIPE.md.
+HEAD_SKIP_CHANNELS = 16
+
+
 class BandTransformer(nn.Module):
     """Spectral-then-spatial band-token segmenter.
 
@@ -543,6 +599,18 @@ class BandTransformer(nn.Module):
             band groups. ``"collapsed"`` is ``CollapsedTokenizer``: a 1x1
             conv mixes all the bands before the patch embedding, so
             ``G = 1``. Any other value raises ``ValueError``.
+        head_skip: ``True`` turns on the head's full-resolution spectral
+            skip (``SegHead(skip_channels=16)``): a 1x1 conv from the input
+            ``x``, ``n_bands`` to 16 channels, joined to the decoder map
+            just before the head's last two convs. Default ``False``, which
+            is the model as it was. Works with both tokenizers.
+
+    The skip reads the same tensor the tokenizer reads, so with
+    ``--standardize`` it sees standardized bands. It adds 4,112 parameters
+    at 224 bands: 492,599 for the fused model and 495,303 for the control.
+    With the skip, a pixel's logits depend on that pixel's own spectrum
+    through a path that does not pass through any token or attention.
+    ``sw.skip_probe`` scores a trained model with either path zeroed.
 
     The band-collapsed control is ``BandTransformer(0, 8,
     tokenizer="collapsed")``: "the same backbone with the band axis
@@ -578,6 +646,7 @@ class BandTransformer(nn.Module):
         patch: int = 8,
         pe_init_std: float = 1.0,
         tokenizer: str = "band",
+        head_skip: bool = False,
     ):
         super().__init__()
         if depth_spectral < 0 or depth_spatial < 0:
@@ -612,6 +681,7 @@ class BandTransformer(nn.Module):
         self.patch = patch
         self.pe_init_std = float(pe_init_std)
         self.tokenizer_kind = tokenizer
+        self.head_skip = bool(head_skip)
 
         # The "band" branch is the constructor call this class always made,
         # in the same place, so a seed still gives the same weights.
@@ -635,7 +705,14 @@ class BandTransformer(nn.Module):
         self.spatial = nn.ModuleList(
             [SpatialBlock(dim, heads, mlp_ratio) for _ in range(depth_spatial)]
         )
-        self.head = SegHead(dim, num_classes=num_classes, patch=patch)
+        # skip_channels 0 builds the head exactly as before the skip existed.
+        self.head = SegHead(
+            dim,
+            num_classes=num_classes,
+            patch=patch,
+            skip_channels=HEAD_SKIP_CHANNELS if head_skip else 0,
+            n_bands=n_bands,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, C, H, W) -> (B, num_classes, H, W)``.
@@ -652,4 +729,7 @@ class BandTransformer(nn.Module):
         for block in self.spatial:
             tokens = block(tokens)  # (B, N, D)
         height, width = x.shape[-2:]
+        if getattr(self.head, "skip", None) is not None:
+            # The skip reads x itself, at the size the model was given.
+            return self.head(tokens, h, w, out_size=(int(height), int(width)), image=x)
         return self.head(tokens, h, w, out_size=(int(height), int(width)))

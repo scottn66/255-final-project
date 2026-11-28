@@ -852,3 +852,193 @@ def test_control_checkpoint_resumes_only_as_the_control(tmp_path, capsys):
     assert resumed["epoch"] == 2
     assert resumed["cfg"]["tokenizer"] == "collapsed"
     assert "tokenizer.reduce.weight" in resumed["model"]
+
+
+# --- The head's full-resolution spectral skip: --head-skip ---
+
+FUSED_BANNER = "transformer  tokenizer band  blocks 2+6  dim 64  heads 4  mlp_ratio 4.0  patch 8"
+SKIP_BANNER = "head skip  on  1x1 conv 224->16 from the model input, at its resolution"
+
+
+def test_head_skip_flag_is_off_by_default_and_adds_4112_parameters():
+    from sw.models.cnn import count_parameters
+    from sw.train import TrainConfig, _build_parser, _check_cfg, build_model
+
+    assert TrainConfig().head_skip is False
+    assert _parse().head_skip is False
+    assert _parse("--model", "transformer").head_skip is False
+    control = ["--tokenizer", "collapsed", "--depth-spectral", "0", "--depth-spatial", "8"]
+    for flags, total in (([], 488_487), (control, 491_191)):
+        off = _parse("--model", "transformer", *flags)
+        on = _parse("--model", "transformer", *flags, "--head-skip")
+        assert (off.head_skip, on.head_skip) == (False, True)
+        _check_cfg(off)
+        _check_cfg(on)
+        assert build_model(off).head.skip is None
+        assert count_parameters(build_model(off)) == total
+        model = build_model(on)
+        assert model.head_skip is True
+        assert count_parameters(model) == total + 4_112
+    assert 488_487 + 4_112 == 492_599 and 491_191 + 4_112 == 495_303
+    # --in-channels is the skip's band count too.
+    assert build_model(_parse("--model", "transformer", "--head-skip", "--group", "8"), in_channels=32).head.skip[0].in_channels == 32
+    # --head-prior-bias still sets the classifier bias.
+    model = build_model(_parse("--model", "transformer", "--head-skip", "--head-prior-bias"))
+    assert model.head.classifier.bias[0] > model.head.classifier.bias[5]  # background above filament
+    helps = {action.dest: action.help for action in _build_parser()._actions}
+    assert "Transformer only" in helps["head_skip"] and "own --out-dir" in helps["head_skip"]
+
+
+def test_head_skip_is_refused_with_the_cnn(tmp_path):
+    from sw.train import _check_cfg, build_model
+
+    cfg = _parse("--head-skip")
+    assert cfg.model == "cnn"
+    for check in (_check_cfg, build_model):
+        with pytest.raises(ValueError, match="--head-skip applies only to --model transformer"):
+            check(cfg)
+    with pytest.raises(ValueError, match="--head-skip applies only to --model transformer"):
+        check(_cfg(model="cnn", head_skip=True))
+    # Through main the refusal comes before any data is read or any folder is made.
+    with pytest.raises(ValueError, match="--head-skip applies only"):
+        main(["--head-skip", "--device", "cpu", "--data-root", str(tmp_path / "no-data"), "--out-dir", str(tmp_path / "run")])
+    assert not (tmp_path / "run").exists()
+
+
+def test_a_config_saved_before_the_head_skip_field_means_off():
+    from dataclasses import asdict
+
+    from sw.train import TrainConfig, _check_cfg, build_model
+
+    old = asdict(TrainConfig(model="transformer"))
+    del old["head_skip"]  # what "cfg" in a checkpoint held before this field existed
+    cfg = TrainConfig(**old)
+    assert cfg.head_skip is False
+    _check_cfg(cfg)
+    model = build_model(cfg)
+    assert model.head.skip is None
+    assert [key for key in model.state_dict() if key.startswith("head.")][-4:] == [
+        "head.fuse.0.weight", "head.fuse.0.bias", "head.classifier.weight", "head.classifier.bias",
+    ]
+
+
+def test_head_skip_banner_line_is_printed_only_when_on(tmp_path, capsys):
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    common = ["--model", "transformer", "--smoke", "--downsample", "2", "--data-root", str(root), "--device", "cpu", "--seed", "0"]
+
+    def banner(name, *flags):
+        capsys.readouterr()
+        result = main([*common, *flags, "--out-dir", str(tmp_path / name)])
+        lines = capsys.readouterr().out.splitlines()
+        start = next(i for i, line in enumerate(lines) if "parameters:" in line)
+        stop = next(i for i, line in enumerate(lines) if line.startswith("device "))
+        return result, lines[start : stop + 1], lines
+
+    # Off: the three lines every earlier run printed, and no line about the skip.
+    result, block, lines = banner("off")
+    assert block == [
+        "BandTransformer parameters: 488,487 (0.488M)",
+        FUSED_BANNER,
+        "device cpu  epochs 1-1  batch 2  lr 0.001  weight_decay 0.0001  schedule cosine  amp off",
+    ]
+    assert not any(line.startswith("head skip") for line in lines)
+    assert result["param_count"] == 488_487
+    saved = torch.load(tmp_path / "off" / "last.pt", map_location="cpu", weights_only=False)
+    assert saved["cfg"]["head_skip"] is False
+    assert not any("skip" in key for key in saved["model"])
+
+    # On: the same lines with the new count, and one more line after the tokenizer line.
+    result, block, lines = banner("on", "--head-skip")
+    assert block == [
+        "BandTransformer parameters: 492,599 (0.493M)",
+        FUSED_BANNER,
+        SKIP_BANNER,
+        "device cpu  epochs 1-1  batch 2  lr 0.001  weight_decay 0.0001  schedule cosine  amp off",
+    ]
+    assert result["param_count"] == 492_599
+    for name in ("last.pt", "best.pt"):
+        saved = torch.load(tmp_path / "on" / name, map_location="cpu", weights_only=False)
+        assert saved["cfg"]["head_skip"] is True
+        assert saved["model"]["head.skip.0.weight"].shape == (16, 224, 1, 1)
+        assert saved["model"]["head.fuse.0.weight"].shape == (32, 48, 1, 1)
+
+    # The control with the skip.
+    result, block, _ = banner("ctl", "--tokenizer", "collapsed", "--depth-spectral", "0", "--depth-spatial", "8", "--head-skip")
+    assert block[:3] == [
+        "BandTransformer parameters: 495,303 (0.495M)",
+        "transformer  tokenizer collapsed  blocks 0+8  dim 64  heads 4  mlp_ratio 4.0  patch 8",
+        SKIP_BANNER,
+    ]
+
+
+def test_a_checkpoint_resumes_only_with_the_head_skip_setting_it_was_trained_with(tmp_path, capsys):
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    small = ["--model", "transformer", "--depth-spectral", "1", "--depth-spatial", "1"]
+
+    def common(name):
+        return ["--downsample", "2", "--data-root", str(root), "--device", "cpu", "--seed", "0", "--out-dir", str(tmp_path / name)]
+
+    longer = ["--epochs", "2", "--batch-size", "2", "--num-workers", "0", "--max-train-images", "4", "--max-val-images", "2", "--max-train-steps", "2"]
+    main([*small, "--smoke", *common("off")])
+    main([*small, "--head-skip", "--smoke", *common("on")])
+    off_last, on_last = tmp_path / "off" / "last.pt", tmp_path / "on" / "last.pt"
+
+    # Each way round is refused with the flag named, before load_state_dict lists keys.
+    before = {path: path.read_bytes() for path in (off_last, on_last)}
+    rows_before = {name: (tmp_path / name / "metrics.jsonl").read_text() for name in ("off", "on")}
+    with pytest.raises(RuntimeError, match="was trained without --head-skip and this run has --head-skip") as raised:
+        main([*small, "--head-skip", *longer, *common("off"), "--resume", str(off_last)])
+    assert "Resume it without the flag" in str(raised.value) and "state_dict" not in str(raised.value)
+    with pytest.raises(RuntimeError, match="was trained with --head-skip and this run has no --head-skip") as raised:
+        main([*small, *longer, *common("on"), "--resume", str(on_last)])
+    assert "Resume it with --head-skip" in str(raised.value)
+    # A refused resume writes nothing.
+    for path, data in before.items():
+        assert path.read_bytes() == data
+    for name, text in rows_before.items():
+        assert (tmp_path / name / "metrics.jsonl").read_text() == text
+
+    # With its own setting each one continues at the next epoch.
+    capsys.readouterr()
+    result = main([*small, "--head-skip", *longer, *common("on"), "--resume", str(on_last)])
+    printed = capsys.readouterr().out
+    assert "next epoch 2" in printed and SKIP_BANNER in printed.splitlines()
+    assert result["epochs_ran"] == 2
+    resumed = torch.load(on_last, map_location="cpu", weights_only=False)
+    assert resumed["epoch"] == 2 and resumed["cfg"]["head_skip"] is True
+    assert "head.skip.0.weight" in resumed["model"]
+
+    # A checkpoint written before the field existed has no "head_skip" in its cfg and no
+    # skip keys. It resumes as a run without the skip.
+    old = torch.load(off_last, map_location="cpu", weights_only=False)
+    del old["cfg"]["head_skip"]
+    torch.save(old, off_last)
+    capsys.readouterr()
+    result = main([*small, *longer, *common("off"), "--resume", str(off_last)])
+    printed = capsys.readouterr().out
+    assert "next epoch 2" in printed and "head skip" not in printed
+    assert result["epochs_ran"] == 2
+    assert torch.load(off_last, map_location="cpu", weights_only=False)["cfg"]["head_skip"] is False
+
+
+def test_head_skip_off_trains_to_the_same_weights_as_the_default(tmp_path):
+    """Two smoke runs from one seed, one with no flag and one built with ``head_skip=False`` by hand."""
+    from sw.models.transformer import BandTransformer
+    from sw.train import set_seed, train
+
+    root = tmp_path / "data"
+    _synthetic_root(root)
+    states = []
+    for name, kwargs in (("a", {}), ("b", {"head_skip": False})):
+        cfg = _cfg(
+            model="transformer", data_root=str(root), out_dir=str(tmp_path / name), batch_size=2,
+            downsample=2, max_train_images=4, max_train_steps=2, depth_spectral=1, depth_spatial=1,
+        )
+        set_seed(0)
+        train(BandTransformer(1, 1, **kwargs), cfg)
+        states.append(torch.load(tmp_path / name / "last.pt", map_location="cpu", weights_only=False)["model"])
+    assert list(states[0]) == list(states[1])
+    for key, value in states[0].items():
+        assert torch.equal(value, states[1][key]), key

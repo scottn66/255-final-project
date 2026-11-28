@@ -458,6 +458,75 @@ def test_flags_that_change_the_run_are_refused_and_resumable_ones_are_not(tmp_pa
     assert gates.run_identity(["--epochs=3", "--lr", "1e-3", "--device", "cuda"]) == ["--lr", "1e-3"]
 
 
+def test_head_skip_is_part_of_the_run_identity(tmp_path):
+    """A folder started without ``--head-skip`` is not resumed with it, or the reverse.
+
+    The identity check reads only the stored flags, so it stops the run
+    before any model is built or any file is changed.
+    """
+    plain = ["--model", "transformer", "--lr", "3e-4", "--batch-size", "8", "--epochs", "60", "--device", "cuda"]
+    skip = ["--model", "transformer", "--lr", "3e-4", "--head-skip", "--batch-size", "8", "--epochs", "90", "--device", "cpu"]
+    assert "--head-skip" in gates.run_identity(skip)
+    assert "--head-skip" not in gates.run_identity(plain)
+    assert gates.run_identity(skip) != gates.run_identity(plain)
+    # --epochs and --device are dropped; --head-skip stays where it was written.
+    assert gates.run_identity(skip) == ["--model", "transformer", "--lr", "3e-4", "--head-skip", "--batch-size", "8"]
+
+    for stored, now in ((plain, skip), (skip, plain)):
+        out = tmp_path / ("plain" if stored is plain else "skip")
+        out.mkdir()
+        (out / gates.ARGS_FILE).write_text(json.dumps(stored))
+        before = sorted(path.name for path in out.iterdir())
+        with pytest.raises(ValueError, match="different flags") as raised:
+            gates.run(out, now)
+        assert "--head-skip" in str(raised.value)
+        assert sorted(path.name for path in out.iterdir()) == before  # nothing written, nothing trained
+
+
+def test_a_refused_resume_leaves_no_new_args_file(tmp_path):
+    """A folder with ``last.pt`` and no ``ARGS.json`` keeps none when its resume is refused.
+
+    Such a folder comes from plain ``sw.train``. ``run`` writes ``ARGS.json``
+    before training starts; if the resume then fails before an epoch
+    finishes, those flags never trained here and must not be recorded, or
+    the right flags would be refused next time.
+    """
+    root = _train_root(tmp_path)
+    out = tmp_path / "run"
+    plain = ["--model", "transformer", *_args(root, 1)[2:]]
+    gates.run(out, plain)
+    (out / gates.DONE_FILE).unlink()
+    (out / gates.ARGS_FILE).unlink()
+    before = {path.name: path.read_bytes() for path in out.iterdir()}
+
+    wrong = ["--model", "transformer", "--head-skip", *_args(root, 2)[2:]]
+    with pytest.raises(RuntimeError, match="--head-skip"):
+        gates.run(out, wrong)
+    assert {path.name: path.read_bytes() for path in out.iterdir()} == before  # no ARGS.json, nothing changed
+
+    # The right flags still resume, and their ARGS.json stays.
+    longer = ["--model", "transformer", *_args(root, 2)[2:]]
+    done = gates.run(out, longer)
+    assert done["resumed"] is True and done["result"]["epochs_ran"] == 2
+    assert json.loads((out / gates.ARGS_FILE).read_text()) == longer
+    # With an ARGS.json in the folder, a failed call does not remove it.
+    (out / gates.DONE_FILE).unlink()
+    with pytest.raises(ValueError, match="different flags"):
+        gates.run(out, wrong)
+    assert json.loads((out / gates.ARGS_FILE).read_text()) == longer
+    # Nor does a resume that fails inside training: the file was there before the call.
+    no_data = [str(tmp_path / "missing") if flag == str(root) else flag for flag in longer]
+    with pytest.raises(Exception):
+        gates.run(out, no_data)
+    assert json.loads((out / gates.ARGS_FILE).read_text()) == longer
+    # A new folder keeps the ARGS.json of a first run that failed, as before.
+    fresh = tmp_path / "fresh"
+    with pytest.raises(Exception):
+        gates.run(fresh, no_data)
+    assert json.loads((fresh / gates.ARGS_FILE).read_text()) == no_data
+    assert not (fresh / gates.RUNNING_FILE).exists()
+
+
 def test_resume_drops_log_rows_written_after_the_checkpoint(tmp_path):
     root = _train_root(tmp_path)
     out = tmp_path / "run"

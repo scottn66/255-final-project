@@ -110,6 +110,25 @@ PYTHONPATH=src python -m sw.train --model transformer --data-root /content/sw_ov
 
 Each `metrics.jsonl` row has `train_fg_miou` and `train_per_class_iou` (from the predictions the training steps already make: train mode, before each step's update, so they lag a little), `train_seconds` (the training pass) and `epoch_seconds` (training plus validation). `metrics.csv` keeps its original columns. The transformer may use `--batch-size 1`; the CNN needs 2 or more (BatchNorm). A transformer `--crop-size` must be a multiple of the patch (8).
 
+## Head skip
+
+`--head-skip` (transformer only, off by default) adds the head's spectral skip from `docs/RECIPE.md`: a 1x1 conv from the 224 bands of the model's input to 16 channels, at the input's own size (full resolution unless `--downsample` is set), joined to the decoder map before the head's last two convs. It adds 4,112 parameters: 492,599 for the fused model and 495,303 for the control. The log prints a `head skip  on ...` line when it is on, and nothing new when it is off. A checkpoint resumes only with the setting it was trained with, so give a head-skip run its own `--out-dir`. `notebooks/10_fullres_head_skip.ipynb` trains both models with it at full resolution and reads notebook 09's two runs as the no-skip reference.
+
+The skip is a path from a pixel's spectrum to its logits that does not pass through the transformer, so a gain could come from the skip alone. To measure that on a finished run:
+
+```bash
+PYTHONPATH=src python -m sw.skip_probe --checkpoint /content/drive/MyDrive/sw_runs/fullres/tf_fused_full_skip/best.pt --device cuda
+```
+
+It scores the validation split three ways: as trained, with the skip zeroed (transformer path only), and with the token path zeroed (skip path only). It uses the run's own settings and its `band_stats.pt`, and stops if that file is missing or if the first row does not reproduce the logged score. Zeroing a path of a jointly trained model is an ablation at test time, not a retrained model. A row with one path off can read lower or higher than the first row. A high skip-only row for a class means the skip alone carries it; a low one does not show that the transformer is needed. Do not compare the skip-zeroed row with a run trained without the skip.
+
+Two things to keep in mind when reading a run with the skip:
+
+- Skip against no skip compares two separate runs. With the skip, the head's last two layers (`fuse` and the classifier) start from different random weights, because `fuse` changes shape; everything before them starts the same at the same seed. With one seed there is no measure of run-to-run spread, so a difference of a few points in FG mIoU is not evidence of an effect.
+- The skip is the same on the fused model and the control, so fused minus control still compares the two encoders. But with the skip both heads read each pixel's 224 bands directly through a 1x1 conv, which is what the control's tokenizer does. On a class where the skip-only row is high, fused minus control says little about band tokens.
+
+The head in the code has dropout 0; `docs/RECIPE.md` lists 0.1.
+
 ## Resume
 
 `last.pt` is written at the end of every epoch. It holds the model, the AdamW state, the scheduler, the finished epoch, and the best validation foreground mIoU. `best.pt` is the best weights only, so resume from `last.pt`.

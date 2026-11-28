@@ -22,7 +22,7 @@
 | Width / heads / MLP | **D = 64, 4 heads, MLP ratio 4, pre-LN** | D {64, 96}; heads {2, 4}; ratio {2, 4} | [E] SSFT uses D=64, 4 heads; ratio 4 per ViT/SegFormer |
 | Params | **≈0.49 M** (table in §2) | stay ≤ ~0.6 M; report the count | [E] SSFT 0.516 M, MiniNet HYPER 0.585 M |
 | Positional | spatial: fixed 2D sin-cos (0 params); spectral: learned group embedding (G×D) | + Mix-FFN 3×3 depthwise conv; LESSViT λ-RoPE (optional, cite-only) | [E] SegFormer, SSFT, ChannelViT |
-| Seg head | 1×1 D→32 → 2× (bilinear ×2 + 3×3 conv) to 128² → bilinear ×2 → concat full-res 1×1 spectral skip (224→16) → 1×1 48→32 → 1×1 → 7 logits (~26 k params, dropout 0.1) | with/without skip (**required ablation**) | [J]; dropout 0.1 [E] repo SegFormer head |
+| Seg head | 1×1 D→32 → 2× (bilinear ×2 + 3×3 conv) to 128² → bilinear ×2 → concat full-res 1×1 spectral skip (224→16) → 1×1 48→32 → 1×1 → 7 logits (~26 k params, dropout 0.1). The skip is implemented as `--head-skip`, off by default; head dropout is 0 in the code. | with/without skip (**required ablation**) | [J]; dropout 0.1 [E] repo SegFormer head |
 | Augment | paper's aug: **rot ±30° + H/V flips**, plus lossless rot90. Mask fill = **ignore 255** | + gain ×U(0.9,1.1); + band-group dropout; + random resized crop | [E] paper; fill fix [J] |
 | Regularization | stochastic depth **0.1** (linear over depth), dropout 0, label smoothing 0 | drop-path {0.1, 0.2}; LS {0, 0.05, 0.1} | [E] DeiT, repo SegFormer-B0 config |
 | Optimizer | **AdamW, peak LR 1e-3**, β=(0.9, 0.999), **wd 0.05** (no wd on norms/biases/embeddings) | LR {5e-4, 1e-3, 2e-3}; wd {0.01, 0.05, 0.1} | [E] repo SegFormer LR; DeiT wd |

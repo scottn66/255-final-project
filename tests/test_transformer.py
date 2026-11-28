@@ -12,10 +12,15 @@ task. The ``SpectralBlock`` and ``SpectralPool`` tests are still
 shape-only. Parameter counts are locked from the layer formulas, down to
 the model total (488,487).
 
-The last section is the band-collapsed control (``tokenizer="collapsed"``):
+The next section is the band-collapsed control (``tokenizer="collapsed"``):
 its parameter match with the fused model, and the reason it has its own
 tokenizer (it sees the order of the band groups; the band tokenizer without
 spectral blocks does not).
+
+The last section is the head's full-resolution spectral skip
+(``head_skip=True``): off by default and then nothing changes, 4,112 more
+parameters when on, and a path that is per pixel (one pixel's spectrum
+changes that pixel's logits and no other).
 """
 
 from __future__ import annotations
@@ -578,8 +583,12 @@ def test_seg_head_shape():
             SegHead(dim=64, **bad)
 
 
-def _reference_head(head, tokens, h, w, out_size):
-    """The head written with torch.nn.functional only, reading its weights."""
+def _reference_head(head, tokens, h, w, out_size, image=None):
+    """The head written with torch.nn.functional only, reading its weights.
+
+    With ``image``, the head's skip is added: a 1x1 conv and a GELU of the
+    image, concatenated after the decoder map.
+    """
     b, n, d = tokens.shape
     y = F.layer_norm(tokens, (d,), head.norm.weight, head.norm.bias, head.norm.eps)
     y = y.permute(0, 2, 1).reshape(b, d, h, w)
@@ -593,6 +602,8 @@ def _reference_head(head, tokens, h, w, out_size):
     rows = torch.arange(out_size[0]).clamp(max=h * p - 1)  # replicate padding, by indexing
     cols = torch.arange(out_size[1]).clamp(max=w * p - 1)
     y = y[:, :, rows][:, :, :, cols]
+    if image is not None:
+        y = torch.cat([y, F.gelu(F.conv2d(image, head.skip[0].weight, head.skip[0].bias))], dim=1)
     y = F.gelu(F.conv2d(y, head.fuse[0].weight, head.fuse[0].bias))
     return F.conv2d(y, head.classifier.weight, head.classifier.bias)
 
@@ -1009,10 +1020,13 @@ def test_collapsed_ignores_group_but_keeps_the_range_checks():
 
 
 def test_tokenizer_is_the_last_constructor_argument():
-    """A positional call written before ``tokenizer`` existed still means what it meant."""
+    """A positional call written before ``tokenizer`` existed still means what it meant.
+
+    ``head_skip`` came later and was added after ``tokenizer``, for the same reason.
+    """
     import inspect
 
-    assert list(inspect.signature(BandTransformer).parameters)[-2:] == ["pe_init_std", "tokenizer"]
+    assert list(inspect.signature(BandTransformer).parameters)[-3:] == ["pe_init_std", "tokenizer", "head_skip"]
     torch.manual_seed(0)
     positional = BandTransformer(1, 1, 32, 2, 4.0, 7, 32, 8, 4, 0.5)
     torch.manual_seed(0)
@@ -1230,3 +1244,245 @@ def test_collapsed_control_smoke(tmp_path, capsys):
     assert last["cfg"]["tokenizer"] == "collapsed"
     assert "tokenizer.reduce.weight" in last["model"]
     assert not any("group_emb" in key for key in last["model"])
+
+
+# --- The head's full-resolution spectral skip: head_skip=True ---
+
+
+def test_head_skip_is_off_by_default_and_then_the_head_is_unchanged():
+    """With the skip off the head adds no module, no key and no random draw.
+
+    The reference is built from torch layers alone, in the order ``SegHead``
+    always built them, so it does not depend on our constructor.
+    """
+    for kwargs in ({}, {"skip_channels": 0}, {"skip_channels": 0, "n_bands": 5}):
+        torch.manual_seed(7)
+        head = SegHead(64, num_classes=7, patch=8, **kwargs)
+        next_draw = torch.rand(4)
+        assert head.skip is None and head.skip_channels == 0
+
+        torch.manual_seed(7)
+        conv = torch.nn.Conv2d
+        parts = torch.nn.ModuleDict(
+            {
+                "norm": torch.nn.LayerNorm(64),
+                "proj": torch.nn.Sequential(conv(64, 32, 1), torch.nn.GELU()),
+                "up": torch.nn.ModuleList(
+                    [torch.nn.Sequential(conv(32, 32, 3, padding=1), torch.nn.GELU()) for _ in range(2)]
+                ),
+                "fuse": torch.nn.Sequential(conv(32, 32, 1), torch.nn.GELU()),
+                "drop": torch.nn.Dropout2d(0.0),
+                "classifier": conv(32, 7, 1),
+            }
+        )
+        assert torch.equal(torch.rand(4), next_draw)  # the same number of draws
+        expected = parts.state_dict()
+        assert list(head.state_dict()) == list(expected)  # same keys, same order
+        for key, value in head.state_dict().items():
+            assert torch.equal(value, expected[key]), key
+        assert [name for name, _ in head.named_modules()] == [name for name, _ in parts.named_modules()]
+
+    assert BandTransformer(1, 1).head_skip is False
+    assert BandTransformer(1, 1).head.skip is None
+
+
+@pytest.mark.parametrize(
+    "args, kwargs, total",
+    [((2, 6), {}, 488_487), ((0, 8), {"tokenizer": "collapsed"}, 491_191)],
+    ids=["fused", "control"],
+)
+def test_head_skip_adds_its_parameters_last_and_moves_nothing_before_the_fuse_conv(args, kwargs, total):
+    for seed in (0, 3):
+        torch.manual_seed(seed)
+        default = BandTransformer(*args, **kwargs)
+        torch.manual_seed(seed)
+        off = BandTransformer(*args, **kwargs, head_skip=False)
+        after_off = torch.rand(4)
+        torch.manual_seed(seed)
+        on = BandTransformer(*args, **kwargs, head_skip=True)
+        after_on = torch.rand(4)
+
+        # Off is the default model: keys, order, values, module names.
+        assert list(off.state_dict()) == list(default.state_dict())
+        for key, value in default.state_dict().items():
+            assert torch.equal(off.state_dict()[key], value), key
+        assert [n for n, _ in off.named_modules()] == [n for n, _ in default.named_modules()]
+        assert not any("skip" in key for key in off.state_dict())
+
+        # On: the old keys in the old order, then the skip conv's two.
+        keys_off, keys_on = list(off.state_dict()), list(on.state_dict())
+        assert keys_on == keys_off + ["head.skip.0.weight", "head.skip.0.bias"]
+        changed = [key for key in keys_off if on.state_dict()[key].shape != off.state_dict()[key].shape]
+        assert changed == ["head.fuse.0.weight"]
+        assert on.state_dict()["head.fuse.0.weight"].shape == (32, 32 + 16, 1, 1)
+        assert on.state_dict()["head.skip.0.weight"].shape == (16, 224, 1, 1)
+        assert len(on.head.skip) == 2 and isinstance(on.head.skip[1], torch.nn.GELU)  # like the other head convs
+        # Every tensor built before fuse draws the weights it drew without the skip.
+        before_fuse = keys_off[: keys_off.index("head.fuse.0.weight")]
+        assert len(before_fuse) == len(keys_off) - 4
+        for key in before_fuse:
+            assert torch.equal(on.state_dict()[key], off.state_dict()[key]), key
+        assert not torch.equal(after_on, after_off)  # the skip does draw
+
+        skip_conv = 224 * 16 + 16  # 1x1 conv with bias
+        wider_fuse = 16 * 32  # 16 more input channels into 32 outputs
+        assert (skip_conv, wider_fuse) == (3_600, 512)
+        assert count_parameters(off) == total
+        assert count_parameters(on) == total + skip_conv + wider_fuse == total + 4_112
+    assert count_parameters(SegHead(64, 7, 8, skip_channels=16, n_bands=224)) == 21_991 + 4_112 == 26_103
+    assert {"fused": 492_599, "control": 495_303}[("control" if kwargs else "fused")] == total + 4_112
+
+
+def test_head_skip_shapes_and_gradients():
+    torch.manual_seed(0)
+    for args, kwargs in (((1, 1), {}), ((0, 2), {"tokenizer": "collapsed"})):
+        model = BandTransformer(*args, **kwargs, head_skip=True)
+        assert model.head_skip is True and model.head.skip_channels == 16 and model.head.n_bands == 224
+        # 30x40 is not a multiple of patch 8; 32x32 is; 8x9 is a single token.
+        for size in ((30, 40), (32, 32), (8, 9)):
+            logits = model(torch.randn(2, 224, *size))
+            assert logits.shape == (2, 7, *size)
+            assert torch.isfinite(logits).all()
+        model.zero_grad()
+        model(torch.randn(2, 224, 30, 40)).sum().backward()
+        for name, parameter in model.named_parameters():
+            assert parameter.grad is not None, name
+        for name in ("head.skip.0.weight", "head.skip.0.bias", "head.fuse.0.weight", "tokenizer.proj.weight"):
+            grad = dict(model.named_parameters())[name].grad
+            assert torch.isfinite(grad).all() and grad.abs().sum() > 0, name
+        # Both halves of the fuse input get a gradient: the decoder map and the skip.
+        fuse_grad = model.head.fuse[0].weight.grad
+        assert fuse_grad[:, :32].abs().sum() > 0 and fuse_grad[:, 32:].abs().sum() > 0
+
+    # Other band counts and widths.
+    small = BandTransformer(1, 1, dim=32, heads=2, n_bands=32, group=8, patch=4, head_skip=True)
+    assert small.head.skip[0].weight.shape == (16, 32, 1, 1)
+    assert small(torch.randn(1, 32, 13, 18)).shape == (1, 7, 13, 18)
+
+
+def test_seg_head_skip_matches_functional_reference_and_checks_its_image():
+    torch.manual_seed(0)
+    for patch, (h, w), out_size in ((8, (3, 5), (24, 40)), (8, (3, 5), (30, 47)), (4, (4, 2), (19, 9)), (1, (5, 3), (5, 3))):
+        head = SegHead(dim=16, num_classes=7, patch=patch, skip_channels=6, n_bands=10).double().eval()
+        tokens = torch.randn(2, h * w, 16, dtype=torch.float64)
+        image = torch.randn(2, 10, *out_size, dtype=torch.float64)
+        out = head(tokens, h, w, out_size=out_size, image=image)
+        expected = _reference_head(head, tokens, h, w, out_size, image=image)
+        assert out.shape == expected.shape == (2, 7, *out_size)
+        assert torch.allclose(out, expected, rtol=0, atol=1e-12), (patch, out_size)
+
+    head = SegHead(dim=16, patch=8, skip_channels=6, n_bands=10)
+    tokens = torch.randn(2, 15, 16)
+    with pytest.raises(ValueError, match="needs the input image"):
+        head(tokens, 3, 5, out_size=(30, 40))
+    for bad in ((2, 10, 24, 40), (2, 9, 30, 40), (1, 10, 30, 40), (2, 10, 30)):
+        with pytest.raises(ValueError, match="for the skip"):
+            head(tokens, 3, 5, out_size=(30, 40), image=torch.randn(*bad))
+    # A head without the skip does not take an image and silently drop it.
+    with pytest.raises(ValueError, match="takes no image"):
+        SegHead(dim=16, patch=8)(tokens, 3, 5, out_size=(30, 40), image=torch.randn(2, 10, 30, 40))
+    with pytest.raises(ValueError, match="skip_channels"):
+        SegHead(dim=16, skip_channels=-1)
+    with pytest.raises(ValueError, match="n_bands"):
+        SegHead(dim=16, skip_channels=4, n_bands=0)
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"tokenizer": "collapsed"}], ids=["band", "collapsed"])
+def test_head_skip_is_a_per_pixel_path(kwargs):
+    """One pixel's spectrum changes that pixel's logits, and only that pixel's.
+
+    The tokens are held fixed (the tokenizer's output is replaced by the one
+    from the unchanged image), so the only way from the changed pixel to
+    the logits is the skip. A 1x1 conv has a receptive field of one pixel.
+    """
+    torch.manual_seed(0)
+    depths = (0, 2) if kwargs else (1, 1)
+    size = (30, 43)  # not a multiple of the patch: rows 24.. and columns 40.. are covered by no token
+    x = torch.randn(1, 224, *size, dtype=torch.float64)
+
+    for head_skip in (True, False):
+        model = BandTransformer(*depths, **kwargs, head_skip=head_skip).double().eval()
+        with torch.no_grad():
+            fixed_tokens = model.tokenizer(x)
+            base = model(x)
+        handle = model.tokenizer.register_forward_hook(lambda module, args, output: fixed_tokens)
+        try:
+            with torch.no_grad():
+                assert torch.equal(model(x), base)  # the hook itself changes nothing
+                # A pixel inside a patch, one on a patch corner, and one past the last full patch.
+                for i, j in ((11, 20), (8, 16), (29, 42)):
+                    changed = x.clone()
+                    changed[0, :, i, j] += torch.randn(224, dtype=torch.float64)
+                    diff = (model(changed) - base).abs().sum(dim=1)[0]  # (H, W)
+                    if head_skip:
+                        assert diff[i, j] > 1e-6
+                        diff[i, j] = 0.0
+                    assert torch.equal(diff, torch.zeros_like(diff)), (head_skip, i, j)
+        finally:
+            handle.remove()
+
+
+def test_head_skip_reads_the_tensor_the_tokenizer_reads():
+    """The skip gets the model's own input, so standardized bands when the input is standardized."""
+    torch.manual_seed(0)
+    model = BandTransformer(1, 1, head_skip=True).eval()
+    seen = {}
+    hooks = [
+        model.tokenizer.register_forward_hook(lambda module, args, output: seen.__setitem__("tokenizer", args[0])),
+        model.head.skip.register_forward_hook(lambda module, args, output: seen.__setitem__("skip", args[0])),
+        model.head.fuse.register_forward_hook(lambda module, args, output: seen.__setitem__("fuse", args[0])),
+    ]
+    x = torch.randn(2, 224, 30, 40)
+    with torch.no_grad():
+        model(x)
+    for hook in hooks:
+        hook.remove()
+    assert seen["tokenizer"] is x and seen["skip"] is x
+    assert seen["fuse"].shape == (2, 32 + 16, 30, 40)  # the decoder map first, then the skip
+    with torch.no_grad():
+        assert torch.equal(seen["fuse"][:, 32:], model.head.skip(x))
+
+
+def test_a_head_object_from_before_the_skip_still_runs():
+    """Unpickling does not run ``__init__``, so an old head object has no ``skip`` attribute."""
+    torch.manual_seed(0)
+    model = BandTransformer(1, 1).eval()
+    x = torch.randn(1, 224, 16, 16)
+    with torch.no_grad():
+        expected = model(x)
+        del model.head.skip
+        assert not hasattr(model.head, "skip")
+        assert torch.equal(model(x), expected)
+
+
+def test_head_skip_model_learns_a_synthetic_task():
+    """60 Adam steps on the spectral-shape patches. Over 10 seeds the worst
+    loss ratio was 0.094 and the worst pixel accuracy 0.958."""
+    torch.manual_seed(0)
+    x, y = _learnable_batch(0)
+    model = BandTransformer(depth_spectral=1, depth_spatial=1, head_skip=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    losses = []
+    for _ in range(60):
+        loss = F.cross_entropy(model(x), y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    model.eval()
+    with torch.no_grad():
+        accuracy = (model(x).argmax(dim=1) == y).float().mean().item()
+    assert losses[-1] < 0.25 * losses[0]
+    assert accuracy > 0.90, accuracy  # chance is 1 / 7
+
+
+def test_head_prior_bias_works_with_the_skip():
+    from sw.data import HYPER_LT_TRAIN_PIXEL_COUNTS
+    from sw.models.transformer import init_seg_head_prior_bias
+
+    model = BandTransformer(1, 1, head_skip=True)
+    bias = init_seg_head_prior_bias(model.head)
+    counts = torch.tensor(HYPER_LT_TRAIN_PIXEL_COUNTS, dtype=torch.float32)
+    assert torch.allclose(bias, (counts / counts.sum()).log())
+    assert torch.equal(model.head.classifier.bias.detach(), bias)
+    assert model(torch.randn(1, 224, 16, 16)).shape == (1, 7, 16, 16)
